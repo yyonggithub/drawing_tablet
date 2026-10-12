@@ -285,6 +285,20 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 **Q: Lines have random spikes/glitches in Krita.**
 *   This is caused by Krita's "Weighted Smoothing" brush setting. Change it to "Basic" or "None" in the Tool Options docker. See the [Krita Configuration](#krita-configuration) section above.
 
+**Q: The build fails in `libspa-sys` / `libspa` (e.g. `no field 'data' on type 'spa_pod_builder'`).**
+*   The `bindgen` version used by `libspa-sys` (0.69) is incompatible with libclang 22+ (e.g. libclang 23). It mis-generates structs that are forward-declared and then defined (such as `spa_pod_builder`) as opaque types, which breaks the build.
+*   Point `LIBCLANG_PATH` at an older libclang (21 or earlier) before building:
+    ```bash
+    export LIBCLANG_PATH=/usr/lib/llvm21/lib   # adjust to your distro's path
+    cargo build
+    ```
+    Or persist it in `.cargo/config.toml`:
+    ```toml
+    [env]
+    LIBCLANG_PATH = "/usr/lib/llvm21/lib"
+    ```
+*   On Nix / devenv this is already handled by the dev shell.
+
 ---
 
 ## 📄 License
