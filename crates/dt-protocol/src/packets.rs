@@ -143,6 +143,16 @@ pub enum ControlPacket {
     /// Client tells server which UDP port to send video to.
     /// This allows the client to use a different port for receiving video.
     SetUdpPort { port: u16 },
+    /// Client reports its display refresh rate so the host can cap the video
+    /// frame rate to it (streaming faster than the panel can show only adds
+    /// queueing latency). `0` means "unknown / do not cap".
+    ///
+    /// Appended after all existing variants so wire variant indices for the
+    /// older packets are unchanged.
+    SetRefreshRate { hz: u16 },
+    /// Round-trip probe: the peer echoes it straight back so the sender can
+    /// estimate the network latency. Sent by the client; echoed by the server.
+    Ping,
 }
 
 /// A framed packet ready for transmission.

@@ -1,9 +1,8 @@
 package com.drawingtablet.network
 
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.DataInputStream
@@ -16,6 +15,8 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
 
 private const val TAG = "NetworkClient"
 private const val HEARTBEAT_TIMEOUT_MS = 5000L
@@ -52,7 +53,10 @@ sealed class ConnectionState {
  */
 class NetworkClient(
     private val serverAddress: String,
-    private val serverPort: Int = 9867
+    private val serverPort: Int = 9867,
+    /** Display refresh rate in Hz, reported to the server so it can cap the
+     *  stream rate. 0 = unknown / don't cap. */
+    private val displayRefreshRateHz: Int = 0
 ) {
     // TCP for input/control
     private var tcpSocket: Socket? = null
@@ -65,19 +69,49 @@ class NetworkClient(
     private var udpReceiveJob: Job? = null
     
     private var heartbeatJob: Job? = null
+    private var pingJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState
 
-    private val _videoPackets = Channel<VideoPacket>(
-        capacity = 2,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    val videoPackets: Channel<VideoPacket> = _videoPackets
+    /**
+     * Estimated one-way network latency in milliseconds (RTT / 2), measured
+     * with the ping round trip. Shown in the stats overlay to split
+     * end-to-end latency into network vs. decode.
+     */
+    private val _networkLatencyMs = MutableStateFlow(0)
+    val networkLatencyMs: StateFlow<Int> = _networkLatencyMs
+
+    /** Send time of the outstanding ping (µs), or 0 when none is pending. */
+    @Volatile
+    private var pingSentAtUs = 0L
+
+    /**
+     * Queue of reassembled frames awaiting decode. Bounded, oldest dropped:
+     * the decoder should always work on the freshest frame.
+     */
+    private val _videoPackets = LinkedBlockingQueue<VideoPacket>(2)
+    val videoPackets: LinkedBlockingQueue<VideoPacket> = _videoPackets
 
     /** Pending fragment buffers keyed by sequence number. */
     private val fragmentBuffers = HashMap<Int, FragmentBuffer>()
+
+    /** Sequence number of the last fully assembled frame, or -1 if none yet. */
+    private var lastCompletedSequence = -1
+
+    /** Rate-limits keyframe requests triggered by loss detection. */
+    private var lastKeyframeRequestMs = 0L
+
+    /**
+     * Dedicated writer for input packets.
+     *
+     * Input events are queued and written immediately on this thread instead
+     * of spawning a coroutine per event (which adds scheduling latency and GC
+     * pressure at stylus rates of several hundred events per second).
+     */
+    private val inputQueue = ArrayBlockingQueue<ByteArray>(1024)
+    private var inputWriterThread: Thread? = null
 
     /** Timestamp of the last packet received from the server. */
     @Volatile
@@ -100,9 +134,17 @@ class NetworkClient(
             withContext(Dispatchers.IO) {
                 val address = InetAddress.getByName(serverAddress)
                 
-                // 1. Create UDP socket first to know the local port
-                udpSocket = DatagramSocket().apply {
+                // 1. Create UDP socket first to know the local port.
+                //    Receive buffer must be enlarged *before* binding; the
+                //    kernel clamps it to net.core.rmem_max.
+                udpSocket = DatagramSocket(null).apply {
                     soTimeout = 100 // Short timeout for non-blocking reads
+                    try {
+                        receiveBufferSize = 2 * 1024 * 1024
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to enlarge UDP receive buffer", e)
+                    }
+                    bind(InetSocketAddress(0))
                 }
                 val udpPort = udpSocket!!.localPort
                 Log.i(TAG, "UDP socket bound to port $udpPort")
@@ -123,36 +165,67 @@ class NetworkClient(
                 )
                 sendTcp(connectPacket)
 
-                // 4. Wait for ConnectAck
-                val response = receiveTcpPacket()
-                when (val decoded = ProtocolCodec.decode(response)) {
-                    is ControlPacket.ConnectAck -> {
-                        Log.i(TAG, "Connected: ${decoded.width}x${decoded.height}")
-                        
-                        // 5. Tell server our UDP port for video
-                        val setPortPacket = ProtocolCodec.encodeControl(
-                            ControlPacket.SetUdpPort(udpPort)
-                        )
-                        sendTcp(setPortPacket)
-                        
-                        lastActivityTime = System.currentTimeMillis()
-                        _connectionState.value = ConnectionState.Connected(decoded.width, decoded.height)
-                        
-                        // Start receive loops
-                        startTcpReceiveLoop()
-                        startUdpReceiveLoop()
-                        startHeartbeat()
+                // 4. Wait for ConnectAck. Any other control packet that
+                //    arrives first (e.g. a heartbeat from a server that does
+                //    not gate them on the handshake) is ignored rather than
+                //    treated as a failed connection.
+                val ackDeadline = System.currentTimeMillis() + TCP_CONNECT_TIMEOUT_MS
+                var handshaked = false
+                while (!handshaked && System.currentTimeMillis() < ackDeadline) {
+                    val response = try {
+                        receiveTcpPacket()
+                    } catch (e: SocketTimeoutException) {
+                        continue
                     }
-                    is ControlPacket.ConnectNack -> {
-                        Log.e(TAG, "Connection refused: ${decoded.reason}")
-                        _connectionState.value = ConnectionState.Error(decoded.reason)
-                        cleanup()
+
+                    when (val decoded = ProtocolCodec.decode(response)) {
+                        is ControlPacket.ConnectAck -> {
+                            Log.i(TAG, "Connected: ${decoded.width}x${decoded.height}")
+
+                            // 5. Tell server our UDP port for video
+                            val setPortPacket = ProtocolCodec.encodeControl(
+                                ControlPacket.SetUdpPort(udpPort)
+                            )
+                            sendTcp(setPortPacket)
+
+                            // 6. Report the display refresh rate so the host
+                            //    can avoid streaming faster than the panel can
+                            //    present.
+                            if (displayRefreshRateHz > 0) {
+                                Log.i(TAG, "Reporting display refresh rate: ${displayRefreshRateHz}Hz")
+                                val refreshPacket = ProtocolCodec.encodeControl(
+                                    ControlPacket.SetRefreshRate(displayRefreshRateHz)
+                                )
+                                sendTcp(refreshPacket)
+                            }
+
+                            lastActivityTime = System.currentTimeMillis()
+                            _connectionState.value = ConnectionState.Connected(decoded.width, decoded.height)
+
+                            // Start receive loops
+                            startTcpReceiveLoop()
+                            startUdpReceiveLoop()
+                            startHeartbeat()
+                            startInputWriter()
+                            startPing()
+                            handshaked = true
+                        }
+                        is ControlPacket.ConnectNack -> {
+                            Log.e(TAG, "Connection refused: ${decoded.reason}")
+                            _connectionState.value = ConnectionState.Error(decoded.reason)
+                            cleanup()
+                            return@withContext
+                        }
+                        else -> {
+                            Log.i(TAG, "Ignoring packet while awaiting ConnectAck: $decoded")
+                        }
                     }
-                    else -> {
-                        Log.e(TAG, "Unexpected response: $decoded")
-                        _connectionState.value = ConnectionState.Error("Unexpected server response")
-                        cleanup()
-                    }
+                }
+
+                if (!handshaked) {
+                    Log.e(TAG, "Timed out waiting for ConnectAck")
+                    _connectionState.value = ConnectionState.Error("Handshake timed out")
+                    cleanup()
                 }
             }
         } catch (e: Exception) {
@@ -183,6 +256,9 @@ class NetworkClient(
         tcpReceiveJob?.cancel()
         udpReceiveJob?.cancel()
         heartbeatJob?.cancel()
+        pingJob?.cancel()
+        pingSentAtUs = 0
+        stopInputWriter()
         
         try { tcpOutput?.close() } catch (e: Exception) {}
         try { tcpInput?.close() } catch (e: Exception) {}
@@ -193,26 +269,64 @@ class NetworkClient(
         tcpOutput = null
         tcpInput = null
         udpSocket = null
+        fragmentBuffers.clear()
+        lastCompletedSequence = -1
     }
 
     /**
      * Send an input event to the server (via TCP).
+     *
+     * Non-blocking: the packet is encoded on the caller's thread and handed
+     * to the dedicated writer thread, so input never waits behind other
+     * network I/O and the UI thread never blocks on a stalled socket.
      */
     fun sendInput(event: TimestampedInputEvent) {
         if (_connectionState.value !is ConnectionState.Connected) return
 
-        scope.launch {
-            try {
-                val packet = InputPacket(
-                    timestamp = event.timestamp,
-                    event = event.event
-                )
-                val data = ProtocolCodec.encodeInput(packet)
-                sendTcp(data)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to send input", e)
-            }
+        val packet = InputPacket(
+            timestamp = event.timestamp,
+            event = event.event
+        )
+        val data = ProtocolCodec.encodeInput(packet)
+
+        if (!inputQueue.offer(data)) {
+            // The writer is backed up (e.g. a WiFi stall). Keep the newest
+            // position rather than stalling the UI thread: a stale queue
+            // feels worse than a slightly sparse stroke.
+            inputQueue.poll()
+            inputQueue.offer(data)
         }
+    }
+
+    /**
+     * Start the dedicated input writer thread (once per session).
+     */
+    private fun startInputWriter() {
+        if (inputWriterThread != null) return
+
+        inputWriterThread = Thread({
+            try {
+                while (!Thread.currentThread().isInterrupted) {
+                    val data = inputQueue.take()
+                    try {
+                        sendTcp(data)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to send input", e)
+                    }
+                }
+            } catch (_: InterruptedException) {
+                // Session is shutting down.
+            }
+        }, "dt-input-writer").apply {
+            priority = Thread.NORM_PRIORITY + 1
+            start()
+        }
+    }
+
+    private fun stopInputWriter() {
+        inputWriterThread?.interrupt()
+        inputWriterThread = null
+        inputQueue.clear()
     }
 
     /**
@@ -283,6 +397,17 @@ class NetworkClient(
                             // Server is alive
                             Log.d(TAG, "TCP heartbeat received")
                         }
+                        is ControlPacket.Ping -> {
+                            // Echo of our ping: estimate the network latency.
+                            val sentAt = pingSentAtUs
+                            if (sentAt > 0) {
+                                pingSentAtUs = 0
+                                val rttUs = SystemClock.elapsedRealtimeNanos() / 1000 - sentAt
+                                if (rttUs in 0..1_000_000) {
+                                    _networkLatencyMs.value = (rttUs / 2 / 1000).toInt()
+                                }
+                            }
+                        }
                         else -> {
                             Log.d(TAG, "TCP received: $decoded")
                         }
@@ -324,14 +449,18 @@ class NetworkClient(
 
                     when (val decoded = ProtocolCodec.decode(data)) {
                         is VideoPacket -> {
-                            Log.d(TAG, "video frag seq=${decoded.sequence} " +
-                                "${decoded.fragmentIndex}/${decoded.fragmentCount} " +
-                                "${decoded.data.size}B keyframe=${decoded.isKeyframe}")
+                            // No per-fragment logging here: at 100 fps a frame
+                            // is up to ~200 datagrams and logcat formatting
+                            // would dominate the receive loop.
+                            decoded.receivedAtMs = SystemClock.uptimeMillis()
                             val complete = assembleFragment(decoded)
                             if (complete != null) {
-                                Log.d(TAG, "assembled seq=${complete.sequence} " +
-                                    "${complete.data.size}B keyframe=${complete.isKeyframe}")
-                                _videoPackets.trySend(complete)
+                                if (!_videoPackets.offer(complete)) {
+                                    // Decoder is behind: drop the oldest frame
+                                    // so we always decode the newest one.
+                                    _videoPackets.poll()
+                                    _videoPackets.offer(complete)
+                                }
                             }
                         }
                         else -> {
@@ -367,6 +496,25 @@ class NetworkClient(
     }
 
     /**
+     * Start the latency probe: one ping per second, echoed by the server, so
+     * the UI can show the network share of the end-to-end latency.
+     */
+    private fun startPing() {
+        pingJob = scope.launch {
+            while (isActive && _connectionState.value is ConnectionState.Connected) {
+                try {
+                    pingSentAtUs = SystemClock.elapsedRealtimeNanos() / 1000
+                    val data = ProtocolCodec.encodeControl(ControlPacket.Ping)
+                    sendTcp(data)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Ping failed", e)
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    /**
      * Buffer a fragment and return a fully-reassembled VideoPacket once all
      * fragments for a given sequence number have arrived, or null if still
      * waiting.  Single-packet frames (fragmentCount == 1) pass through
@@ -374,6 +522,7 @@ class NetworkClient(
      */
     private fun assembleFragment(fragment: VideoPacket): VideoPacket? {
         if (fragment.fragmentCount == 1) {
+            noteCompletedSequence(fragment.sequence)
             return fragment
         }
 
@@ -405,6 +554,10 @@ class NetworkClient(
                 if (oldest != fragment.sequence) {
                     Log.d(TAG, "evicting incomplete seq=$oldest")
                     fragmentBuffers.remove(oldest)
+                    // The decoder will be missing a reference frame, so ask
+                    // the server for a fresh keyframe instead of waiting for
+                    // the next periodic one.
+                    requestKeyframeThrottled()
                 } else {
                     break
                 }
@@ -422,14 +575,37 @@ class NetworkClient(
             offset += piece.size
         }
 
+        noteCompletedSequence(buf.sequence)
+
         return VideoPacket(
             sequence = buf.sequence,
             timestamp = buf.timestamp,
             isKeyframe = buf.isKeyframe,
             fragmentIndex = 0,
             fragmentCount = 1,
-            data = assembled
+            data = assembled,
+            receivedAtMs = fragment.receivedAtMs
         )
+    }
+
+    /**
+     * Track completed frame sequences and ask for a recovery keyframe when a
+     * gap is detected (Moonlight-style IDR request on loss).
+     */
+    private fun noteCompletedSequence(sequence: Int) {
+        if (lastCompletedSequence >= 0 && sequence != lastCompletedSequence + 1) {
+            Log.d(TAG, "Frame gap: expected ${lastCompletedSequence + 1}, got $sequence")
+            requestKeyframeThrottled()
+        }
+        lastCompletedSequence = sequence
+    }
+
+    /** Ask the server for a keyframe, at most once every 100 ms. */
+    private fun requestKeyframeThrottled() {
+        val now = System.currentTimeMillis()
+        if (now - lastKeyframeRequestMs < 100) return
+        lastKeyframeRequestMs = now
+        requestKeyframe()
     }
 
     fun close() {

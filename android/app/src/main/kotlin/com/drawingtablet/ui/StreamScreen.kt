@@ -31,13 +31,14 @@ import com.drawingtablet.input.InputCapture
 import com.drawingtablet.network.NetworkClient
 import com.drawingtablet.network.VideoPacket
 import com.drawingtablet.video.VideoDecoder
-import kotlinx.coroutines.channels.Channel
+import java.util.concurrent.LinkedBlockingQueue
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun StreamScreen(
     client: NetworkClient,
-    videoPackets: Channel<VideoPacket>,
+    videoPackets: LinkedBlockingQueue<VideoPacket>,
     width: Int,
     height: Int,
     onDisconnect: () -> Unit,
@@ -50,6 +51,8 @@ fun StreamScreen(
 
     val decoder = remember { VideoDecoder() }
     val fps by decoder.fps.collectAsState()
+    val decodeLatencyMs by decoder.decodeLatencyMs.collectAsState()
+    val netLatencyMs by client.networkLatencyMs.collectAsState()
 
     DisposableEffect(Unit) {
         onDispose {
@@ -66,13 +69,24 @@ fun StreamScreen(
         // letterboxes/pillarboxes correctly on any screen shape
         AndroidView(
             factory = { context ->
+                // The panel's refresh rate hints the decoder and is reported
+                // to the host (which caps the stream rate to match it).
+                val displayRefresh = context.display?.refreshRate?.roundToInt() ?: 0
+
                 SurfaceView(context).apply {
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            decoder.configure(width, height, holder.surface)
-                            decoder.startDecoding(videoPackets)
-                            isDecoderReady = true
-                            client.requestKeyframe()
+                            // Wire recovery before starting so no early decode
+                            // error can miss the callback.
+                            decoder.onNeedKeyframe = { client.requestKeyframe() }
+                            isDecoderReady = decoder.configure(
+                                width, height, holder.surface,
+                                refreshRate = displayRefresh
+                            )
+                            if (isDecoderReady) {
+                                decoder.startDecoding(videoPackets)
+                                client.requestKeyframe()
+                            }
                         }
 
                         override fun surfaceChanged(
@@ -138,6 +152,11 @@ fun StreamScreen(
                         )
                         Text(
                             text = "${width}\u00d7${height}",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = "net ${netLatencyMs}ms \u00b7 decode ${decodeLatencyMs}ms",
                             color = Color.White.copy(alpha = 0.7f),
                             fontSize = 14.sp
                         )

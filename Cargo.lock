@@ -1033,6 +1033,7 @@ dependencies = [
  "dt-protocol",
  "eframe",
  "image 0.24.9",
+ "libc",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

@@ -18,6 +18,7 @@ import com.drawingtablet.network.NetworkClient
 import com.drawingtablet.ui.ConnectionScreen
 import com.drawingtablet.ui.StreamScreen
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private var client: NetworkClient? = null
@@ -78,8 +79,10 @@ class MainActivity : ComponentActivity() {
             // Close existing client if any
             currentClient?.close()
 
-            // Create new client and connect
-            val newClient = NetworkClient(address, port)
+            // Create new client and connect, telling it our display refresh
+            // rate so the host can cap the stream rate to our panel.
+            val refreshRate = this@MainActivity.display?.refreshRate?.roundToInt() ?: 0
+            val newClient = NetworkClient(address, port, refreshRate)
             currentClient = newClient
             client = newClient
 

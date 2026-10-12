@@ -5,9 +5,10 @@
 //! - UDP for low-latency video streaming (to client)
 
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -30,15 +31,57 @@ pub enum NetworkError {
 }
 
 /// UDP server for video streaming (server -> client).
+///
+/// Deliberately backed by a blocking `std` socket: it is driven from the
+/// dedicated video sender thread, which wants a tight send loop without
+/// per-packet async scheduling overhead.
 pub struct UdpServer {
-    socket: UdpSocket,
+    socket: std::net::UdpSocket,
 }
 
 impl UdpServer {
-    /// Bind to the specified address.
-    pub async fn bind(addr: SocketAddr) -> Result<Self, NetworkError> {
-        let socket = UdpSocket::bind(addr).await?;
+    /// Bind to the specified address and apply low-latency socket options.
+    pub fn bind(addr: SocketAddr) -> Result<Self, NetworkError> {
+        let socket = std::net::UdpSocket::bind(addr)?;
         socket.set_broadcast(false)?;
+
+        // Mark packets with DSCP AF41 so WMM/QoS-aware network gear
+        // prioritises the video flow. Best effort: some systems restrict it.
+        let tos: libc::c_int = 0x88; // AF41 (34) << 2
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                &tos as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            warn!(
+                "Failed to set DSCP on video socket: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Absorb keyframe bursts without blocking the sender thread.
+        // (The kernel clamps this to net.core.wmem_max.)
+        let sndbuf: libc::c_int = 4 * 1024 * 1024;
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &sndbuf as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            warn!(
+                "Failed to enlarge video socket send buffer: {}",
+                std::io::Error::last_os_error()
+            );
+        }
 
         Ok(Self { socket })
     }
@@ -50,17 +93,10 @@ impl UdpServer {
     }
 
     /// Send a packet to the specified address.
-    #[allow(dead_code)]
-    pub async fn send(&self, data: &[u8], addr: SocketAddr) -> Result<(), NetworkError> {
-        self.socket.send_to(data, addr).await?;
-        Ok(())
-    }
-
-    /// Send multiple packets to the same address efficiently.
-    pub async fn send_batch(&self, packets: &[&[u8]], addr: SocketAddr) -> Result<(), NetworkError> {
-        for packet in packets {
-            self.socket.send_to(packet, addr).await?;
-        }
+    ///
+    /// Blocking; only safe/appropriate from the sender thread.
+    pub fn send(&self, data: &[u8], addr: SocketAddr) -> Result<(), NetworkError> {
+        self.socket.send_to(data, addr)?;
         Ok(())
     }
 }
@@ -235,5 +271,34 @@ async fn handle_tcp_client(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_send_delivers_packets_in_order() {
+        let server = UdpServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            server.send(payload, receiver.local_addr().unwrap()).unwrap();
+        }
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 32];
+        for _ in 0..3 {
+            let (n, _) = receiver.recv_from(&mut buf).unwrap();
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(
+            got,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
     }
 }

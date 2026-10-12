@@ -7,4 +7,4 @@ mod portal;
 mod pipewire;
 
 pub use portal::{MonitorInfo, select_monitor};
-pub use pipewire::{Frame, FrameData, PixelFormat, ScreenCapture, CaptureError};
+pub use pipewire::{Frame, FrameData, PixelFormat, ScreenCapture, CaptureError, DmaBufFd, monotonic_us};

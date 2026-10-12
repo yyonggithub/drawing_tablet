@@ -68,7 +68,7 @@ impl DtServerApp {
             running_flag,
             port_input: "9999".to_string(),
             bitrate_input: "8000".to_string(),
-            keyframe_input: "10".to_string(),
+            keyframe_input: "120".to_string(),
             show_help_dialog: false,
             rt,
             server_task: None,
@@ -84,7 +84,7 @@ impl DtServerApp {
         let port = self.port_input.trim().parse::<u16>().unwrap_or(9999);
         let fps = 100; // Hardcoded FPS limit
         let bitrate = self.bitrate_input.trim().parse::<u32>().unwrap_or(50000).max(1000);
-        let keyframe_interval = self.keyframe_input.trim().parse::<u32>().unwrap_or(2).max(1);
+        let keyframe_interval = self.keyframe_input.trim().parse::<u32>().unwrap_or(120).max(1);
 
         let config = ServerConfig {
             port,
@@ -148,7 +148,7 @@ impl eframe::App for DtServerApp {
         // Widget styles
         visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(22, 36, 30); // Card background
         visuals.widgets.noninteractive.fg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_gray(180));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(180));
 
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(28, 44, 36); // Input fields
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 56, 46);
@@ -430,7 +430,7 @@ impl eframe::App for DtServerApp {
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(12, 20, 16))
                 .corner_radius(6.0)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(26, 42, 34)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(26, 42, 34)))
                 .inner_margin(10.0)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()

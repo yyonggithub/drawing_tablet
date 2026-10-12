@@ -29,7 +29,12 @@ data class VideoPacket(
     val isKeyframe: Boolean,
     val fragmentIndex: Int,
     val fragmentCount: Int,
-    val data: ByteArray
+    val data: ByteArray,
+    /**
+     * Client-side only: `SystemClock.uptimeMillis()` when this frame finished
+     * arriving. Not part of the wire format; used for the decode-latency stat.
+     */
+    var receivedAtMs: Long = 0L
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -114,6 +119,18 @@ sealed class ControlPacket {
     object Disconnect : ControlPacket()
     /** Tell the server which UDP port to send video to. */
     data class SetUdpPort(val port: Int) : ControlPacket()
+    /**
+     * Report the display refresh rate (Hz) so the host can cap the stream
+     * rate to the panel. 0 = unknown / don't cap. Appended after SetUdpPort so
+     * existing wire variant indices are unchanged (server-side index 7).
+     */
+    data class SetRefreshRate(val hz: Int) : ControlPacket()
+    /**
+     * Round-trip probe echoed by the peer; used to estimate network latency.
+     * Appended after SetRefreshRate so existing wire variant indices are
+     * unchanged (server-side index 8).
+     */
+    object Ping : ControlPacket()
 }
 
 /**
@@ -242,6 +259,13 @@ object ProtocolCodec {
                 buffer.putInt(6) // Variant index for SetUdpPort
                 buffer.putShort(packet.port.toShort())
             }
+            is ControlPacket.SetRefreshRate -> {
+                buffer.putInt(7) // Variant index for SetRefreshRate
+                buffer.putShort(packet.hz.toShort())
+            }
+            is ControlPacket.Ping -> {
+                buffer.putInt(8) // Variant index for Ping
+            }
             else -> {}
         }
 
@@ -294,6 +318,7 @@ object ProtocolCodec {
                 ControlPacket.ConnectNack(String(reasonBytes))
             }
             3 -> ControlPacket.Heartbeat
+            8 -> ControlPacket.Ping
             else -> null
         }
     }

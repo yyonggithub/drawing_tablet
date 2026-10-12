@@ -56,7 +56,7 @@ impl Default for EncoderConfig {
             height: 1080,
             fps: 100,
             bitrate: 25000,
-            keyframe_interval: 2,
+            keyframe_interval: 120,
         }
     }
 }
@@ -99,7 +99,7 @@ impl VideoEncoder {
             "appsrc name=src format=time is-live=true do-timestamp=true \
              caps=video/x-raw,format=BGRA,width={width},height={height},framerate={fps}/1 ! \
              cudaupload ! \
-             nvh264enc bitrate={bitrate} gop-size={keyframe} rc-mode=cbr preset=p4 \
+             nvh264enc bitrate={bitrate} gop-size={keyframe} rc-mode=cbr preset=p1 \
              zerolatency=true tune=low-latency \
              aud=true repeat-sequence-header=true ! \
              video/x-h264,stream-format=byte-stream,alignment=au ! \
@@ -208,21 +208,26 @@ impl VideoEncoder {
     }
 
     /// Encode a captured frame.
-    pub fn encode(&mut self, frame: &Frame) -> Result<Option<EncodedFrame>, EncoderError> {
-        let mut buffer = match &frame.data {
-            FrameData::MemPtr(data) => {
-                let normalized = self.normalize_frame_data(frame, data)?;
-                let mut buf = gst::Buffer::with_size(normalized.len())
-                    .map_err(|e| EncoderError::EncodingFailed(e.to_string()))?;
+    ///
+    /// Takes the frame by value so the pixel buffer can be handed to
+    /// GStreamer without another copy. Every output buffer the encoder has
+    /// ready is appended to `out` (usually one, but draining them all avoids
+    /// withholding already-encoded data behind the next `encode` call).
+    pub fn encode(
+        &mut self,
+        mut frame: Frame,
+        out: &mut Vec<EncodedFrame>,
+    ) -> Result<(), EncoderError> {
+        // Steal the pixel storage out of the frame; the remainder (geometry,
+        // format, stride) is still needed below.
+        let frame_data = std::mem::replace(&mut frame.data, FrameData::MemPtr(Vec::new()));
 
-                {
-                    let buffer_mut = buf.get_mut().unwrap();
-                    let mut map = buffer_mut
-                        .map_writable()
-                        .map_err(|e| EncoderError::EncodingFailed(e.to_string()))?;
-                    map.copy_from_slice(&normalized);
-                }
-                buf
+        let mut buffer = match frame_data {
+            FrameData::MemPtr(data) => {
+                let normalized = normalize_frame_data(&frame, data)?;
+                // Wrap the Vec directly instead of copying it into a fresh
+                // GstBuffer: for 4K BGRA this saves ~33 MB per frame.
+                gst::Buffer::from_mut_slice(normalized)
             }
             FrameData::DmaBuf {
                 fd,
@@ -230,13 +235,14 @@ impl VideoEncoder {
                 stride,
                 modifier: _,
             } => {
-                // Dup the FD because GStreamer memory will own it
-                let fd = unsafe { libc::dup(*fd) };
+                // Dup the FD because GStreamer memory will own it (the frame's
+                // own fd is closed when the DmaBufFd guard drops).
+                let fd = unsafe { libc::dup(fd.as_raw_fd()) };
                 if fd < 0 {
                     return Err(EncoderError::EncodingFailed("dup failed".to_string()));
                 }
 
-                let size = (*stride * frame.height) as usize;
+                let size = (stride * frame.height) as usize;
                 let allocator = gst_allocators::DmaBufAllocator::new();
                 let memory =
                     unsafe { gst_allocators::DmaBufAllocator::alloc(&allocator, fd, size) }
@@ -266,11 +272,11 @@ impl VideoEncoder {
                     ) {
                         if !meta.offset().is_empty() {
                             let ptr = meta.offset().as_ptr() as *mut usize;
-                            unsafe { *ptr = *offset as usize };
+                            unsafe { *ptr = offset as usize };
                         }
                         if !meta.stride().is_empty() {
                             let ptr = meta.stride().as_ptr() as *mut i32;
-                            unsafe { *ptr = *stride as i32 };
+                            unsafe { *ptr = stride as i32 };
                         }
                     }
                 }
@@ -314,105 +320,21 @@ impl VideoEncoder {
 
         self.frame_count += 1;
 
-        // Try to pull encoded frame
-        self.pull_encoded_frame()
+        // Drain every encoded frame that is already available.
+        self.pull_encoded_frames(out);
+
+        Ok(())
     }
 
-    fn normalize_frame_data(&self, frame: &Frame, data: &[u8]) -> Result<Vec<u8>, EncoderError> {
-        if frame.format == PixelFormat::Unknown {
-            return Err(EncoderError::UnsupportedFormat(frame.format));
-        }
-
-        let bytes_per_pixel = 4usize;
-        let row_len = frame.width as usize * bytes_per_pixel;
-        let mut stride = frame.stride as usize;
-        let expected_row_data = row_len * frame.height as usize;
-
-        if stride == row_len
-            && data.len() > expected_row_data
-            && data.len().is_multiple_of(frame.height as usize)
-        {
-            let inferred = data.len() / frame.height as usize;
-            if inferred >= row_len {
-                stride = inferred;
-            }
-        }
-
-        let expected_len = stride * frame.height as usize;
-
-        if data.len() < expected_len {
-            return Err(EncoderError::EncodingFailed(format!(
-                "frame data too small: got {} bytes, expected at least {}",
-                data.len(),
-                expected_len
-            )));
-        }
-
-        if stride == row_len {
-            return Ok(self.convert_pixel_format(frame, &data[..expected_row_data]));
-        }
-
-        let mut packed = vec![0u8; row_len * frame.height as usize];
-        for row in 0..frame.height as usize {
-            let src_start = row * stride;
-            let src_end = src_start + row_len;
-            let dst_start = row * row_len;
-            let dst_end = dst_start + row_len;
-            packed[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
-        }
-
-        Ok(self.convert_pixel_format(frame, &packed))
-    }
-
-    fn convert_pixel_format(&self, frame: &Frame, data: &[u8]) -> Vec<u8> {
-        match frame.format {
-            PixelFormat::Bgra | PixelFormat::Bgrx => data.to_vec(),
-            PixelFormat::Rgba | PixelFormat::Rgbx => {
-                let mut out = data.to_vec();
-                for pixel in out.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-                out
-            }
-            PixelFormat::Unknown => data.to_vec(),
-        }
-    }
-
-    /// Pull an encoded frame from the pipeline (non-blocking).
-    fn pull_encoded_frame(&mut self) -> Result<Option<EncodedFrame>, EncoderError> {
-        match self
+    /// Append every ready encoded frame from the pipeline to `out`.
+    fn pull_encoded_frames(&mut self, out: &mut Vec<EncodedFrame>) {
+        while let Some(sample) = self
             .appsink
             .try_pull_sample(gst::ClockTime::from_mseconds(0))
         {
-            Some(sample) => {
-                let buffer = sample
-                    .buffer()
-                    .ok_or_else(|| EncoderError::EncodingFailed("no buffer".to_string()))?;
-
-                let map = buffer
-                    .map_readable()
-                    .map_err(|e| EncoderError::EncodingFailed(e.to_string()))?;
-
-                let pts = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
-
-                // Check if it's a keyframe by looking for NAL unit type
-                let is_keyframe = is_h264_keyframe(map.as_slice());
-
-                if is_keyframe {
-                    debug!(
-                        "Keyframe detected, pts: {}, size: {} bytes",
-                        pts,
-                        map.as_slice().len()
-                    );
-                }
-
-                Ok(Some(EncodedFrame {
-                    is_keyframe,
-                    pts,
-                    data: map.as_slice().to_vec(),
-                }))
+            if let Some(frame) = sample_to_encoded(&sample) {
+                out.push(frame);
             }
-            None => Ok(None),
         }
     }
 
@@ -428,23 +350,8 @@ impl VideoEncoder {
             .appsink
             .try_pull_sample(gst::ClockTime::from_mseconds(100))
         {
-            if let Some(buffer) = sample.buffer() {
-                if let Ok(map) = buffer.map_readable() {
-                    let pts = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
-                    let is_keyframe = is_h264_keyframe(map.as_slice());
-                    if is_keyframe {
-                        debug!(
-                            "Flush keyframe detected, pts: {}, size: {} bytes",
-                            pts,
-                            map.as_slice().len()
-                        );
-                    }
-                    frames.push(EncodedFrame {
-                        is_keyframe,
-                        pts,
-                        data: map.as_slice().to_vec(),
-                    });
-                }
+            if let Some(frame) = sample_to_encoded(&sample) {
+                frames.push(frame);
             }
         }
 
@@ -456,6 +363,20 @@ impl Drop for VideoEncoder {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// Convert a pulled GStreamer sample into an `EncodedFrame`.
+fn sample_to_encoded(sample: &gst::Sample) -> Option<EncodedFrame> {
+    let buffer = sample.buffer()?;
+    let map = buffer.map_readable().ok()?;
+    let pts = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
+    let is_keyframe = is_h264_keyframe(map.as_slice());
+
+    Some(EncodedFrame {
+        is_keyframe,
+        pts,
+        data: map.as_slice().to_vec(),
+    })
 }
 
 /// Check if H.264 data contains keyframe NAL units (SPS, PPS, or IDR).
@@ -506,6 +427,79 @@ fn is_h264_keyframe(data: &[u8]) -> bool {
     has_idr || has_sps || has_pps
 }
 
+/// Normalize a captured frame to tightly packed BGRA/BGRX bytes.
+///
+/// Takes ownership of the pixel data and converts in place where possible:
+/// the result is handed to `gst::Buffer::from_mut_slice`, so nothing between
+/// capture and encoder copies the multi-megabyte frame again.
+fn normalize_frame_data(frame: &Frame, data: Vec<u8>) -> Result<Vec<u8>, EncoderError> {
+    if frame.format == PixelFormat::Unknown {
+        return Err(EncoderError::UnsupportedFormat(frame.format));
+    }
+
+    let bytes_per_pixel = 4usize;
+    let row_len = frame.width as usize * bytes_per_pixel;
+    let mut stride = frame.stride as usize;
+    let expected_row_data = row_len * frame.height as usize;
+
+    if stride == row_len
+        && data.len() > expected_row_data
+        && data.len().is_multiple_of(frame.height as usize)
+    {
+        let inferred = data.len() / frame.height as usize;
+        if inferred >= row_len {
+            stride = inferred;
+        }
+    }
+
+    let expected_len = stride * frame.height as usize;
+
+    if data.len() < expected_len {
+        return Err(EncoderError::EncodingFailed(format!(
+            "frame data too small: got {} bytes, expected at least {}",
+            data.len(),
+            expected_len
+        )));
+    }
+
+    if stride == row_len {
+        // Guard against over-long chunks (some producers page-round the
+        // buffer size); GStreamer expects exactly stride * height bytes.
+        let mut data = data;
+        if data.len() > expected_row_data {
+            data.truncate(expected_row_data);
+        }
+        return Ok(convert_pixel_format(frame.format, data));
+    }
+
+    // Strided rows need repacking; reuse the owned buffer for that.
+    let mut packed = vec![0u8; expected_row_data];
+    for row in 0..frame.height as usize {
+        let src_start = row * stride;
+        let src_end = src_start + row_len;
+        let dst_start = row * row_len;
+        let dst_end = dst_start + row_len;
+        packed[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+    }
+
+    Ok(convert_pixel_format(frame.format, packed))
+}
+
+/// Convert pixel data to BGRA, swapping the R and B channels in place for
+/// RGBA/RGBX input.
+fn convert_pixel_format(format: PixelFormat, mut data: Vec<u8>) -> Vec<u8> {
+    match format {
+        PixelFormat::Bgra | PixelFormat::Bgrx => data,
+        PixelFormat::Rgba | PixelFormat::Rgbx => {
+            for pixel in data.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            data
+        }
+        PixelFormat::Unknown => data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +517,60 @@ mod tests {
         // Non-IDR slice
         let non_idr = &[0x00, 0x00, 0x00, 0x01, 0x41, 0x9A];
         assert!(!is_h264_keyframe(non_idr));
+    }
+
+    fn mem_frame(width: u32, height: u32, format: PixelFormat, stride: u32, data: Vec<u8>) -> Frame {
+        Frame {
+            width,
+            height,
+            format,
+            stride,
+            data: FrameData::MemPtr(data),
+            capture_us: 0,
+        }
+    }
+
+    #[test]
+    fn bgra_with_tight_rows_passes_through_unchanged() {
+        let data: Vec<u8> = (0u8..16).collect(); // 2x2 BGRA
+        let frame = mem_frame(2, 2, PixelFormat::Bgra, 8, data.clone());
+        let out = normalize_frame_data(&frame, data).unwrap();
+        assert_eq!(out, (0u8..16).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn rgba_is_converted_to_bgra_in_place() {
+        let data = vec![1, 2, 3, 4]; // one RGBA pixel
+        let frame = mem_frame(1, 1, PixelFormat::Rgba, 4, data.clone());
+        let out = normalize_frame_data(&frame, data).unwrap();
+        assert_eq!(out, vec![3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn strided_bgra_rows_are_repacked_densely() {
+        // 2x2 pixels with 4 bytes of row padding (stride 12).
+        let data = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, //
+            9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0,
+        ];
+        let frame = mem_frame(2, 2, PixelFormat::Bgra, 12, data.clone());
+        let out = normalize_frame_data(&frame, data).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn undersized_frame_data_is_rejected() {
+        let frame = mem_frame(2, 2, PixelFormat::Bgra, 8, vec![0; 4]);
+        assert!(normalize_frame_data(&frame, vec![0; 4]).is_err());
+    }
+
+    #[test]
+    fn overlong_tight_chunk_is_truncated_to_the_frame() {
+        // 1x3 BGRA pixels = 12 bytes; the chunk carries 2 extra bytes and is
+        // not a whole number of rows, so no stride inference applies.
+        let data: Vec<u8> = (0u8..14).collect();
+        let frame = mem_frame(1, 3, PixelFormat::Bgra, 4, data.clone());
+        let out = normalize_frame_data(&frame, data).unwrap();
+        assert_eq!(out, (0u8..12).collect::<Vec<u8>>());
     }
 }

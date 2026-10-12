@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -57,12 +57,30 @@ impl From<VideoFormat> for PixelFormat {
     }
 }
 
+/// A DMA-BUF file descriptor that closes itself when dropped.
+#[derive(Debug)]
+pub struct DmaBufFd(pub i32);
+
+impl DmaBufFd {
+    pub fn as_raw_fd(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Drop for DmaBufFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
 /// Frame data types.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum FrameData {
     /// DMA-BUF file descriptor with modifier.
     DmaBuf {
-        fd: i32,
+        fd: DmaBufFd,
         offset: u32,
         stride: u32,
         modifier: u64,
@@ -71,18 +89,8 @@ pub enum FrameData {
     MemPtr(Vec<u8>),
 }
 
-impl Drop for FrameData {
-    fn drop(&mut self) {
-        if let FrameData::DmaBuf { fd, .. } = self {
-            if *fd >= 0 {
-                unsafe { libc::close(*fd) };
-            }
-        }
-    }
-}
-
 /// A captured frame.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Frame {
     /// Width in pixels.
     pub width: u32,
@@ -94,6 +102,18 @@ pub struct Frame {
     pub stride: u32,
     /// Frame data.
     pub data: FrameData,
+    /// Capture time in microseconds on the process-wide monotonic clock
+    /// (see [`monotonic_us`]); used to measure pipeline latency.
+    pub capture_us: u64,
+}
+
+/// Microseconds since a process-wide monotonic origin.
+///
+/// Producers and consumers in different crates can compare their samples
+/// directly (unlike separate `Instant::now()` origins).
+pub fn monotonic_us() -> u64 {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
 /// Screen capture handle.
@@ -265,6 +285,7 @@ fn run_capture_loop(
                             format: PixelFormat::Bgra, // Assuming BGRA for now
                             stride,
                             data: FrameData::MemPtr(frame_data),
+                            capture_us: monotonic_us(),
                         };
 
                         let _ = frame_tx_clone.try_send(frame);
@@ -381,5 +402,35 @@ fn fourcc_to_spa(fourcc: DrmFourcc) -> VideoFormat {
         DrmFourcc::Abgr2101010 => VideoFormat::ABGR_210LE,
         DrmFourcc::Xbgr2101010 => VideoFormat::xBGR_210LE,
         _ => panic!("Unsupported format"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dma_buf_fd_closes_on_drop() {
+        // Use a pipe so we can observe the close without depending on fd
+        // numbers being reused (which would make an fcntl-based check flaky).
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // Non-blocking so a leaked write end cannot hang the test.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+        {
+            let guard = DmaBufFd(write_fd);
+            assert_eq!(guard.as_raw_fd(), write_fd);
+        }
+
+        // If the guard closed the write end this read sees EOF (0 bytes).
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        assert_eq!(n, 0, "DmaBufFd should have closed the write end on drop");
+
+        unsafe { libc::close(read_fd) };
     }
 }

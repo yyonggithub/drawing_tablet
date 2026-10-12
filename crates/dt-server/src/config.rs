@@ -26,7 +26,7 @@ impl Default for ServerConfig {
             port: 9999,
             fps: 60,
             bitrate: 8000,
-            keyframe_interval: 10,
+            keyframe_interval: 120,
             output_name: None,
             tablet: TabletDescriptor::default(),
         }
@@ -101,7 +101,7 @@ fn print_help() {
     println!("    -p, --port <PORT>              UDP port to listen on [default: 9999]");
     println!("    -f, --fps <FPS>                Target frame rate [default: 100]");
     println!("    -b, --bitrate <KBPS>           Target bitrate in kbps [default: 8000]");
-    println!("    -k, --keyframe-interval <N>    Keyframe interval in frames [default: 10]");
+    println!("    -k, --keyframe-interval <N>    Keyframe interval in frames [default: 120]");
     println!("    -h, --help                     Print help information");
     println!();
     println!("ENVIRONMENT VARIABLES:");
