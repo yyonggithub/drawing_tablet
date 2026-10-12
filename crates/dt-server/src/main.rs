@@ -55,13 +55,16 @@ impl Drop for AvahiService {
 }
 
 fn get_hostname() -> String {
-    Command::new("hostname")
-        .output()
+    // Read the kernel hostname directly. Shelling out to the `hostname` binary
+    // is unreliable: it is not installed on every system (e.g. minimal Arch
+    // installs), which previously made the server advertise itself as
+    // "Drawing Tablet (Unknown)".
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "Unknown".to_string())
-        .trim()
-        .to_string()
 }
 
 fn main() -> Result<()> {

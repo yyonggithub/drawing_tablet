@@ -26,7 +26,14 @@ bincode = "1"
 evdev = "0.12"
 
 # Screen capture
-ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+# Use ashpd's `async-std` feature, which maps to `zbus/async-io` (NOT the
+# tokio executor). We must avoid `zbus/tokio`: Cargo unifies features globally,
+# so enabling it forces the tokio executor onto every zbus consumer in the
+# build — including `accesskit_unix` (pulled in by eframe/egui), which drives
+# zbus from its own non-tokio executor and panics with
+# "there is no reactor running". Keeping zbus on `async-io` lets both the
+# portal (ashpd) and accessibility coexist.
+ashpd = { version = "0.10", default-features = false, features = ["async-std"] }
 pipewire = "0.8"
 libspa = "0.8"
 libspa-sys = "0.8"
