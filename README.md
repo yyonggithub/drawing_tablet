@@ -18,7 +18,7 @@ The result is a Cintiq-like experience on your Android tablet, entirely over WiF
 ## ✨ Features
 
 *   **Millisecond Input Latency:** TCP-based protocol for instant cursor response.
-*   **High-Quality Screen Mirroring:** H.264/H.265 hardware encoding.
+*   **High-Quality Screen Mirroring:** H.264 hardware encoding (NVENC / VA-API, with an x264 software fallback).
 *   **Full Wacom Emulation:** Supports Pressure, Tilt, and Hover.
 *   **Gesture Support:** Pinch-to-zoom, Pan, and Rotate support in apps like Krita/GIMP (Server-side gesture handling).
 *   **Wayland Native:** Built for modern Linux desktops (GNOME/KDE/Sway).
@@ -195,7 +195,7 @@ just android-deploy
 just run-release
 ```
 *   On first run, a "Screen Share" dialog will appear (handled by XDG Portal). Select the screen you want to mirror.
-*   The server listens on **TCP/UDP Port 9867** (TCP for input, UDP for video).
+*   The server listens on **TCP/UDP Port 9999** by default (TCP for input/control, UDP for video). Change it in the GUI or with `--port`.
 
 ### 2. Start the Client
 1.  Open the **Drawing Tablet** app on Android.
@@ -208,6 +208,7 @@ just run-release
 *   **Touch:**
     *   **1 Finger:** Ignored (to prevent accidental drawing).
     *   **2+ Fingers:** Zoom/Pan/Rotate gestures.
+*   **Stats overlay:** Tap the ⓘ button (bottom-right) to show FPS, estimated one-way network latency (`net`) and client-side receive→render latency (`decode`).
 
 ---
 
@@ -239,9 +240,9 @@ We bypass the slow X11 capture methods by using **PipeWire** directly.
 
 ### 2. Video Encoding (`crates/dt-encoder`)
 Raw pixels are heavy (4K @ 60fps is huge). We pipe the buffer into **GStreamer**.
-*   **Pipeline:** `appsrc -> videoconvert -> vaapih264enc -> rtph264pay -> udpsink`
-*   **Hardware Acceleration:** We explicitly target `vaapih264enc` (Intel/AMD) or `nvh264enc` (Nvidia) to keep CPU usage low (< 5%).
-*   **Network:** The encoded NAL units are packetized into RTP and blasted over UDP. We prioritize **latency over reliability**—dropped frames are better than old frames.
+*   **Pipeline:** `appsrc -> cudaupload -> nvh264enc` (Nvidia), `appsrc -> vaapipostproc -> vaapih264enc` (Intel/AMD), or `appsrc -> videoconvert -> x264enc` (software fallback) — selected automatically at startup. The pixel buffer is handed to GStreamer without an extra copy.
+*   **Hardware Acceleration:** H.264 only (no HEVC/AV1). NVENC uses the `p1` preset with zero-latency tuning; VA-API uses `tune=low-latency` with a single reference frame. Keyframes are sent every 120 frames by default.
+*   **Network:** Encoded NAL units are split into ≤1400-byte datagrams and sent over UDP with a small custom header (sequence number, fragment index/count) — there is no RTP layer. The video socket is marked DSCP AF41 and the frame rate is capped to the refresh rate the client reports. Input and control go over TCP. We prioritize **latency over reliability**—dropped frames are better than old frames.
 
 ### 3. Input Emulation (`crates/dt-input`)
 We use the Linux kernel's `uinput` module to create two virtual devices:
@@ -269,7 +270,7 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 ## ❓ Troubleshooting
 
 **Q: Connection fails immediately.**
-*   Check your firewall (`sudo ufw allow 9867/tcp` and `sudo ufw allow 9867/udp`).
+*   Check your firewall (`sudo ufw allow 9999/tcp` and `sudo ufw allow 9999/udp`, adjusting the port if you changed it).
 *   Ensure both devices are on the same 5GHz WiFi network.
 
 **Q: "Failed to create virtual device" error.**
