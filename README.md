@@ -19,6 +19,8 @@ The result is a Cintiq-like experience on your Android tablet, entirely over WiF
 
 *   **Millisecond Input Latency:** TCP-based protocol for instant cursor response.
 *   **High-Quality Screen Mirroring:** H.264 hardware encoding (NVENC / VA-API, with an x264 software fallback).
+*   **Built-in Latency Stats:** per-second network, bitrate and end-to-end frame-latency reporting (server terminal + in-app overlay).
+*   **Clean Lifecycle:** start/stop the service from the GUI; closing the window shuts everything down without leaving helper processes behind.
 *   **Full Wacom Emulation:** Supports Pressure, Tilt, and Hover.
 *   **Gesture Support:** Pinch-to-zoom, Pan, and Rotate support in apps like Krita/GIMP (Server-side gesture handling).
 *   **Wayland Native:** Built for modern Linux desktops (GNOME/KDE/Sway).
@@ -150,6 +152,9 @@ devenv shell
 *   **Android SDK Platform 34** (Android 14).
 *   **NDK** (Side-by-side).
 
+> Runtime extras (screen sharing via mDNS discovery, hardware/software encoders)
+> are covered in [Configuration & Usage](#-configuration--usage).
+
 ---
 
 ## 📦 Compilation & Installation
@@ -165,20 +170,13 @@ just build
 just build-release
 ```
 
-### 2. Set up udev Rules (Important!)
-To allow the server to create virtual input devices without `sudo`, you need a udev rule.
+### 2. Set up `uinput` (Important!)
 
-Create `/etc/udev/rules.d/99-drawing-tablet.rules`:
-```bash
-KERNEL=="uinput", GROUP="input", MODE="0660"
-```
-Then run:
-```bash
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-sudo usermod -aG input $USER
-```
-*Log out and back in for the group change to take effect.*
+The server creates the virtual pen/touch devices through the kernel's
+`uinput` module, which needs a one-time setup (load the module, add the udev
+rule, join the group). See **Configuration & Usage → 0.1 `uinput`** below for
+the exact commands — and for the pitfall where `/dev/uinput` exists but the
+module is not loaded.
 
 ### 3. Build the Android App
 Open the `android/` directory in Android Studio and hit **Run**, or use the CLI:
@@ -188,27 +186,153 @@ just android-deploy
 
 ---
 
-## 🎮 Usage
+## 🚀 Configuration & Usage
 
-### 1. Start the Server
+### 0. One-time setup (Linux server)
+
+#### 0.1 `uinput` — virtual tablet (required)
+
+Pen/touch events are injected through the kernel's `uinput` module, which must
+be **loaded** and its device node **writable by your user**:
+
+```bash
+sudo modprobe uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf   # load it at boot
+
+sudo groupadd -f uinput
+sudo tee /etc/udev/rules.d/99-drawing-tablet.rules >/dev/null <<'EOF'
+KERNEL=="uinput", GROUP="uinput", MODE="0660"
+EOF
+sudo usermod -aG uinput "$USER"           # log out / back in afterwards
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --name-match=uinput
+```
+
+Verify (want `crw-rw---- root uinput`):
+
+```bash
+ls -l /dev/uinput
+```
+
+> **Pitfall:** if `/dev/uinput` shows `crw------- root root` **and**
+> `lsmod | grep uinput` prints nothing, the module is not loaded and the node
+> is a leftover — udev never sees it, so the udev rule cannot help. Run
+> `sudo modprobe uinput` first, then re-trigger udev.
+
+#### 0.2 Encoder (one of the three; the server auto-detects)
+
+| Backend | GPU | Requirements |
+| :--- | :--- | :--- |
+| `nvh264enc` (NVENC) | NVIDIA | working driver (`nvidia-smi` OK) + GStreamer `nvcodec`/CUDA elements |
+| `vaapih264enc` (VA-API) | Intel / AMD | `gst-plugin-va` (or `gstreamer-vaapi`) |
+| `x264enc` (software) | — | `gst-plugins-ugly`; more CPU and latency |
+
+Check what is available:
+
+```bash
+gst-inspect-1.0 nvh264enc || gst-inspect-1.0 vaapih264enc || gst-inspect-1.0 x264enc
+```
+
+The server logs the backend it chose (`Using NVENC encoder …` /
+`Video encoder pipeline started (nvh264enc)`). If none can be created it
+prints `no usable H.264 encoder` and the reason for each backend.
+
+#### 0.3 mDNS discovery — `avahi`
+
+The Android app finds servers only through the mDNS advertisement, so
+`avahi-publish` (package `avahi` / `avahi-utils`) must be installed. The
+server publishes `_drawingtablet._udp` on the LAN together with a TXT record
+containing its IPv4 address.
+
+#### 0.4 Firewall
+
+Allow the port (default **9999**) for **both** TCP (input/control) and UDP
+(video):
+
+```bash
+sudo ufw allow 9999/tcp && sudo ufw allow 9999/udp
+```
+
+### 1. Start the server
+
 ```bash
 just run-release
+# or, if `just` is not installed:
+cargo run --release --bin dt-server
+# or run the built binary directly:
+./target/release/dt-server
 ```
-*   On first run, a "Screen Share" dialog will appear (handled by XDG Portal). Select the screen you want to mirror.
-*   The server listens on **TCP/UDP Port 9999** by default (TCP for input/control, UDP for video). Change it in the GUI or with `--port`.
 
-### 2. Start the Client
-1.  Open the **Drawing Tablet** app on Android.
-2.  The app will automatically scan for the server on your local network.
-3.  When your computer appears in the list, **tap it to connect**.
-    *   *Optional:* Check **"Remember this server"** to auto-connect in the future.
+Set the options in the GUI and press **START SERVER**:
 
-### 3. Draw!
-*   **Pen:** Drawing, pressure, and tilt should work immediately in GIMP/Krita/Blender.
-*   **Touch:**
-    *   **1 Finger:** Ignored (to prevent accidental drawing).
-    *   **2+ Fingers:** Zoom/Pan/Rotate gestures.
-*   **Stats overlay:** Tap the ⓘ button (bottom-right) to show FPS, estimated one-way network latency (`net`) and client-side receive→render latency (`decode`).
+| Field | Default | Meaning |
+| :--- | :--- | :--- |
+| Port | 9999 | TCP (input/control) + UDP (video) port |
+| Bitrate (kbps) | 8000 | target video bitrate — lower it on a congested link |
+| Keyframe Int | 120 | keyframe every N frames (smaller = more bandwidth, faster loss recovery) |
+
+On the first start a **"Share your screen"** portal dialog appears — pick the
+monitor to mirror. The encoded frame rate is capped to the refresh rate the
+tablet reports (a 60 Hz panel is streamed at ≤ 60 fps).
+
+### 2. Connect the tablet
+
+1.  Install the APK (`just android-deploy`, or open `android/` in Android Studio).
+2.  Tablet and PC on the **same LAN — prefer 5 GHz**.
+3.  Open the app: the server appears in the list (mDNS). Tap it to connect.
+    *   *Optional:* tick **"Remember this server"** to auto-connect later.
+
+### 3. Draw
+
+*   **Pen:** drawing, pressure, tilt and hover work immediately in GIMP/Krita/Blender.
+*   **Touch:** 1 finger is ignored (no accidental strokes); 2+ fingers zoom/pan/rotate.
+*   **Stats overlay:** tap the ⓘ button to show `frame`, `net`, `bitrate`, `dec` and FPS.
+
+### 4. Stop
+
+*   **STOP SERVER** stops the service; the window stays open so you can start it again.
+*   **Closing the window** stops the service and exits the process. No helper
+    processes are left behind (the `avahi-publish` advertisement dies with it).
+
+### 5. Reading the latency numbers
+
+The server prints one line per second:
+
+```
+capture->send: avg 1.1 ms, max 2.0 ms, 3.6 Mbps, fps cap/enc/sent 60/60/58, dropped 2
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `capture->send` | time from capture to the datagrams leaving the socket (queue + encode) |
+| `Mbps` | sent video bitrate |
+| `fps cap/enc/sent` | captured / encoded / sent frames per second |
+| `dropped` | captured frames dropped (backpressure or the frame-rate cap) |
+
+The tablet logs the same information it shows in the overlay:
+
+| Field | Meaning |
+| :--- | :--- |
+| `frame` | **end-to-end video latency**: server capture → submitted for display |
+| `net` | one-way network latency (RTT/2, from a ping every second) |
+| `bitrate` | received video bitrate |
+| `dec` | receive → display latency |
+
+Rough total ≈ `frame` + one display refresh. If `frame` is much larger than
+`capture->send` + `net`, the client is the bottleneck (look at `queueDrop` /
+`decDrop` in the logs). If the server's `Mbps` is much higher than the
+tablet's `bitrate`, the link is dropping packets (try 5 GHz, or lower the
+bitrate).
+
+### 6. Configuration reference
+
+Configuration is done entirely in the GUI (`Port`, `Bitrate`, `Keyframe Int`).
+
+> Note: the `--port` / `--fps` / `--bitrate` CLI flags and the `DT_PORT` /
+> `DT_FPS` / `DT_BITRATE` environment variables that exist in
+> `crates/dt-server/src/config.rs` are **not wired up yet** — the GUI is the
+> only effective configuration path, and the encoder frame rate is fixed at
+> 100 fps (further capped by the tablet's reported refresh rate).
 
 ---
 
@@ -255,6 +379,9 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 
 ## 📜 Justfile Commands
 
+`just` is optional — every recipe maps to a plain `cargo`/`gradle`/`adb`
+command (see [Configuration & Usage](#-configuration--usage)).
+
 | Command | Description |
 | :--- | :--- |
 | `just build` | Build server (Debug) |
@@ -269,15 +396,36 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 
 ## ❓ Troubleshooting
 
+**Q: The server fails right after Start with "Cannot open /dev/uinput" / "Failed to create virtual device".**
+*   The `uinput` module is not loaded or the node is not writable. See the
+    one-time `uinput` setup in **Configuration & Usage → 0.1** above:
+    `sudo modprobe uinput`, the udev rule, and membership in the `uinput`
+    group. If `/dev/uinput` is `crw------- root root` while
+    `lsmod | grep uinput` is empty, the module is simply not loaded.
+    (Running the server with `sudo` also works but is not recommended.)
+
+**Q: The server reports "no usable H.264 encoder".**
+*   The error lists why each backend failed. Common causes:
+    *   **NVENC**: the loaded NVIDIA kernel module does not match the
+        userspace library (typical right after a driver update) — **reboot**.
+        If `nvidia-smi` works but NVENC still fails, clear the GStreamer
+        plugin cache (it can cache the "no encoder" state):
+        `rm -f ~/.cache/gstreamer-1.0/registry.*.bin`.
+    *   **x264 fallback missing**: install `gst-plugins-ugly` (`x264enc`).
+    *   **VA-API missing**: install `gst-plugin-va` (or `gstreamer-vaapi`).
+
 **Q: Connection fails immediately.**
 *   Check your firewall (`sudo ufw allow 9999/tcp` and `sudo ufw allow 9999/udp`, adjusting the port if you changed it).
-*   Ensure both devices are on the same 5GHz WiFi network.
-
-**Q: "Failed to create virtual device" error.**
-*   You missed the **udev rules** step. Run the commands in the Installation section or run the server with `sudo` (not recommended).
+*   Ensure both devices are on the same LAN — preferably 5 GHz. 2.4 GHz adds
+    tens of milliseconds of airtime queueing.
+*   Discovery relies on mDNS: make sure `avahi-publish` is installed. With
+    `avahi-browse -rt _drawingtablet._udp` you should see the service with a
+    TXT record like `ip=192.168.1.20` — the app connects to that address
+    (Android's NSD otherwise only reports the IPv6 link-local address).
 
 **Q: The screen is black on Android.**
-*   Check the server logs. If `vaapi` fails, install `gstreamer1.0-vaapi`.
+*   Check the server logs for the encoder line (`Using … encoder`). If it fell
+    back to `x264enc` or failed, see the encoder question above.
 *   Ensure you selected a screen in the portal dialog.
 
 **Q: GIMP selects instead of zooming.**
@@ -285,6 +433,16 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 
 **Q: Lines have random spikes/glitches in Krita.**
 *   This is caused by Krita's "Weighted Smoothing" brush setting. Change it to "Basic" or "None" in the Tool Options docker. See the [Krita Configuration](#krita-configuration) section above.
+
+**Q: The picture is still laggy even though the stats look good.**
+*   The measured `frame` latency covers "server capture → tablet display"; the
+    other half of the round trip (pen event → PC → drawing app renders →
+    compositor produces a frame) happens inside the drawing application.
+    Krita's brush smoothing is the usual culprit: set **Brush Smoothing** to
+    **None** (or *Weighted*) — *Stabilizer* deliberately adds lag. See
+    [Krita Configuration](#krita-configuration).
+*   Lower the **Bitrate** (or raise **Keyframe Int**) if the tablet's received
+    bitrate is much lower than the server's sent bitrate.
 
 **Q: The build fails in `libspa-sys` / `libspa` (e.g. `no field 'data' on type 'spa_pod_builder'`).**
 *   The `bindgen` version used by `libspa-sys` (0.69) is incompatible with libclang 22+ (e.g. libclang 23). It mis-generates structs that are forward-declared and then defined (such as `spa_pod_builder`) as opaque types, which breaks the build.
