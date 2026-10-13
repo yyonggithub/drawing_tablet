@@ -47,6 +47,25 @@ pub enum TabletError {
     InvalidSlot { slot: u8, max: u8 },
 }
 
+/// Map a uinput error, adding an actionable hint for the common permission
+/// failure (missing udev rule / group membership).
+fn device_creation_error(e: std::io::Error) -> TabletError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return TabletError::DeviceCreation(std::io::Error::new(
+            e.kind(),
+            format!(
+                "{e}. Cannot open /dev/uinput. Load the module (`sudo modprobe uinput`) \
+                 and make the device writable by your user: udev rule \
+                 `KERNEL==\"uinput\", GROUP=\"uinput\", MODE=\"0660\"`, join the \
+                 `uinput` group, then run \
+                 `sudo udevadm control --reload-rules && sudo udevadm trigger \
+                 --action=add --name-match=uinput`."
+            ),
+        ));
+    }
+    TabletError::DeviceCreation(e)
+}
+
 /// A virtual input system that separates Pen and Touch into two devices.
 pub struct VirtualTablet {
     pen_device: VirtualDevice,
@@ -129,29 +148,29 @@ impl VirtualTablet {
         let pen_id = InputId::new(BusType::BUS_VIRTUAL, descriptor.vid, descriptor.pid, 0x0100);
 
         let pen_device = VirtualDeviceBuilder::new()
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .name(&descriptor.name)
             .input_id(pen_id)
             .with_keys(&pen_keys)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_properties(&pen_props)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&abs_x)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&abs_y)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&abs_pressure)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&abs_tilt_x)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&abs_tilt_y)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&abs_distance)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_msc(&msc_supported)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .build()
-            .map_err(TabletError::DeviceCreation)?;
+            .map_err(device_creation_error)?;
 
         // --- Device 2: Touchpad (Multitouch) ---
         // Match Pen resolution
@@ -194,27 +213,27 @@ impl VirtualTablet {
         let touch_id = InputId::new(BusType::BUS_USB, descriptor.vid, descriptor.pid, 0x0101);
 
         let touch_device = VirtualDeviceBuilder::new()
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .name("Drawing Tablet Touch")
             .input_id(touch_id)
             .with_keys(&touch_keys)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_properties(&touch_props)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&mt_slot)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&mt_tracking_id)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&mt_position_x)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             .with_absolute_axis(&mt_position_y)
-            .map_err(TabletError::DeviceCreation)?
+            .map_err(device_creation_error)?
             // .with_absolute_axis(&abs_x_legacy) // REMOVED
-            // .map_err(TabletError::DeviceCreation)?
+            // .map_err(device_creation_error)?
             // .with_absolute_axis(&abs_y_legacy) // REMOVED
-            // .map_err(TabletError::DeviceCreation)?
+            // .map_err(device_creation_error)?
             .build()
-            .map_err(TabletError::DeviceCreation)?;
+            .map_err(device_creation_error)?;
 
         info!("Virtual tablet devices created successfully");
 

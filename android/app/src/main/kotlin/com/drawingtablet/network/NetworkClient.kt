@@ -9,6 +9,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -17,10 +18,12 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "NetworkClient"
 private const val HEARTBEAT_TIMEOUT_MS = 5000L
 private const val TCP_CONNECT_TIMEOUT_MS = 5000
+private const val TCP_CONNECT_ATTEMPT_TIMEOUT_MS = 1500
 private const val TCP_READ_TIMEOUT_MS = 100
 
 /** Accumulator for a fragmented video frame. */
@@ -88,6 +91,27 @@ class NetworkClient(
     private var pingSentAtUs = 0L
 
     /**
+     * Estimated `client_clock - server_clock` offset in microseconds, derived
+     * from ping round trips. Shared with the decoder so it can turn a frame's
+     * server capture timestamp into a true capture -> display latency.
+     */
+    val serverClockOffsetUs = AtomicLong(0)
+
+    /** Recent offset estimates; the smallest (least-delayed) one is used. */
+    private val offsetSamples = ArrayDeque<Long>(8)
+
+    /** Video payload bytes received since the last report (for bitrate). */
+    private val videoBytesSinceReport = AtomicLong(0)
+
+    /** Completed frames received / dropped since the last report. */
+    private val framesReceived = AtomicLong(0)
+    private val queueDrops = AtomicLong(0)
+
+    /** Received video bitrate in Mbps, updated once per second. */
+    private val _bitrateMbps = MutableStateFlow(0f)
+    val bitrateMbps: StateFlow<Float> = _bitrateMbps
+
+    /**
      * Queue of reassembled frames awaiting decode. Bounded, oldest dropped:
      * the decoder should always work on the freshest frame.
      */
@@ -132,8 +156,6 @@ class NetworkClient(
 
         try {
             withContext(Dispatchers.IO) {
-                val address = InetAddress.getByName(serverAddress)
-                
                 // 1. Create UDP socket first to know the local port.
                 //    Receive buffer must be enlarged *before* binding; the
                 //    kernel clamps it to net.core.rmem_max.
@@ -148,16 +170,40 @@ class NetworkClient(
                 }
                 val udpPort = udpSocket!!.localPort
                 Log.i(TAG, "UDP socket bound to port $udpPort")
-                
-                // 2. Connect TCP socket
-                tcpSocket = Socket().apply {
-                    soTimeout = TCP_READ_TIMEOUT_MS
-                    tcpNoDelay = true // Disable Nagle's algorithm for lower latency
-                    connect(InetSocketAddress(address, serverPort), TCP_CONNECT_TIMEOUT_MS)
+
+                // 2. Connect TCP. Resolve every address and try them in order,
+                //    IPv4 first: a host name can map to several addresses (the
+                //    mDNS host is advertised on every interface, including
+                //    unreachable bridges and IPv6 link-local) and the server
+                //    listens on IPv4.
+                val candidates = InetAddress.getAllByName(serverAddress)
+                    .sortedByDescending { it is Inet4Address }
+                Log.i(TAG, "TCP candidates: ${candidates.map { it.hostAddress }}")
+
+                var lastError: Exception? = null
+                var socket: Socket? = null
+                for (address in candidates) {
+                    try {
+                        socket = Socket().apply {
+                            soTimeout = TCP_READ_TIMEOUT_MS
+                            tcpNoDelay = true // Disable Nagle's algorithm for lower latency
+                            connect(
+                                InetSocketAddress(address, serverPort),
+                                TCP_CONNECT_ATTEMPT_TIMEOUT_MS
+                            )
+                        }
+                        Log.i(TAG, "TCP connected to ${address.hostAddress}:$serverPort")
+                        break
+                    } catch (e: Exception) {
+                        Log.w(TAG, "TCP connect to ${address.hostAddress} failed: ${e.message}")
+                        lastError = e
+                    }
                 }
+
+                tcpSocket = socket ?: throw (lastError
+                    ?: IllegalStateException("No address to connect to"))
                 tcpOutput = DataOutputStream(tcpSocket!!.getOutputStream())
                 tcpInput = DataInputStream(tcpSocket!!.getInputStream())
-                Log.i(TAG, "TCP connected to $serverAddress:$serverPort")
 
                 // 3. Send Connect packet over TCP
                 val connectPacket = ProtocolCodec.encodeControl(
@@ -258,6 +304,12 @@ class NetworkClient(
         heartbeatJob?.cancel()
         pingJob?.cancel()
         pingSentAtUs = 0
+        offsetSamples.clear()
+        serverClockOffsetUs.set(0)
+        videoBytesSinceReport.set(0)
+        framesReceived.set(0)
+        queueDrops.set(0)
+        _bitrateMbps.value = 0f
         stopInputWriter()
         
         try { tcpOutput?.close() } catch (e: Exception) {}
@@ -398,13 +450,29 @@ class NetworkClient(
                             Log.d(TAG, "TCP heartbeat received")
                         }
                         is ControlPacket.Ping -> {
-                            // Echo of our ping: estimate the network latency.
+                            // Echo of our ping (older server without Pong):
+                            // still good enough for the round-trip estimate.
                             val sentAt = pingSentAtUs
                             if (sentAt > 0) {
                                 pingSentAtUs = 0
                                 val rttUs = SystemClock.elapsedRealtimeNanos() / 1000 - sentAt
                                 if (rttUs in 0..1_000_000) {
                                     _networkLatencyMs.value = (rttUs / 2 / 1000).toInt()
+                                }
+                            }
+                        }
+                        is ControlPacket.Pong -> {
+                            // Our ping echoed with the server's clock.
+                            val sentAt = pingSentAtUs
+                            if (sentAt > 0) {
+                                pingSentAtUs = 0
+                                val receivedAt = SystemClock.elapsedRealtimeNanos() / 1000
+                                val rttUs = receivedAt - sentAt
+                                if (rttUs in 0..1_000_000) {
+                                    _networkLatencyMs.value = (rttUs / 2 / 1000).toInt()
+                                    // Assumes both directions are roughly
+                                    // symmetric so one-way ~= rtt / 2.
+                                    addOffsetSample(receivedAt - decoded.serverUs - rttUs / 2)
                                 }
                             }
                         }
@@ -455,11 +523,14 @@ class NetworkClient(
                             decoded.receivedAtMs = SystemClock.uptimeMillis()
                             val complete = assembleFragment(decoded)
                             if (complete != null) {
+                                videoBytesSinceReport.addAndGet(complete.data.size.toLong())
+                                framesReceived.incrementAndGet()
                                 if (!_videoPackets.offer(complete)) {
                                     // Decoder is behind: drop the oldest frame
                                     // so we always decode the newest one.
                                     _videoPackets.poll()
                                     _videoPackets.offer(complete)
+                                    queueDrops.incrementAndGet()
                                 }
                             }
                         }
@@ -496,8 +567,9 @@ class NetworkClient(
     }
 
     /**
-     * Start the latency probe: one ping per second, echoed by the server, so
-     * the UI can show the network share of the end-to-end latency.
+     * Start the latency probe: one ping per second, replied to with a Pong
+     * carrying the server clock, so the UI can show the network share and the
+     * end-to-end frame latency. Also reports the received bitrate.
      */
     private fun startPing() {
         pingJob = scope.launch {
@@ -510,8 +582,33 @@ class NetworkClient(
                     Log.w(TAG, "Ping failed", e)
                 }
                 delay(1000)
+                reportStats()
             }
         }
+    }
+
+    /** Print the once-per-second network stats: latency, bitrate, drops. */
+    private fun reportStats() {
+        val bytes = videoBytesSinceReport.getAndSet(0)
+        val mbps = bytes * 8.0 / 1_000_000.0
+        _bitrateMbps.value = mbps.toFloat()
+        val rx = framesReceived.getAndSet(0)
+        val drops = queueDrops.getAndSet(0)
+        Log.i(
+            TAG,
+            "net ${_networkLatencyMs.value}ms, bitrate ${"%.1f".format(mbps)}Mbps, " +
+                "rx ${rx}fps, queueDrop $drops"
+        )
+    }
+
+    /**
+     * Keep the smallest recent offset estimate: the least-delayed round trip
+     * yields the most accurate clock offset.
+     */
+    private fun addOffsetSample(offsetUs: Long) {
+        offsetSamples.addLast(offsetUs)
+        if (offsetSamples.size > 5) offsetSamples.removeFirst()
+        serverClockOffsetUs.set(offsetSamples.minOrNull() ?: 0L)
     }
 
     /**

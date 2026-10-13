@@ -321,10 +321,24 @@ mod tests {
     }
 
     #[test]
+    fn test_pong_roundtrip() {
+        let encoded = encode_control(&ControlPacket::Pong {
+            server_us: 12_345_678,
+        })
+        .unwrap();
+        match decode_packet(&encoded).unwrap() {
+            DecodedPacket::Control(ControlPacket::Pong { server_us }) => {
+                assert_eq!(server_us, 12_345_678);
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_control_variant_indices_are_stable() {
         // Pinned so that a variant appended to the enum cannot silently
         // renumber existing packets on the wire.
-        let cases: [(ControlPacket, u32); 9] = [
+        let cases: [(ControlPacket, u32); 10] = [
             (ControlPacket::Connect { version: 2 }, 0),
             (ControlPacket::ConnectAck { width: 1, height: 1 }, 1),
             (ControlPacket::ConnectNack { reason: String::new() }, 2),
@@ -334,6 +348,7 @@ mod tests {
             (ControlPacket::SetUdpPort { port: 1 }, 6),
             (ControlPacket::SetRefreshRate { hz: 60 }, 7),
             (ControlPacket::Ping, 8),
+            (ControlPacket::Pong { server_us: 0 }, 9),
         ];
 
         for (packet, expected) in cases {

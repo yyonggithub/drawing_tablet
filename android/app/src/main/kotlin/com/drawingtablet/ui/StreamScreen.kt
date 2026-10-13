@@ -52,7 +52,9 @@ fun StreamScreen(
     val decoder = remember { VideoDecoder() }
     val fps by decoder.fps.collectAsState()
     val decodeLatencyMs by decoder.decodeLatencyMs.collectAsState()
+    val frameLatencyMs by decoder.frameLatencyMs.collectAsState()
     val netLatencyMs by client.networkLatencyMs.collectAsState()
+    val bitrateMbps by client.bitrateMbps.collectAsState()
 
     DisposableEffect(Unit) {
         onDispose {
@@ -79,6 +81,9 @@ fun StreamScreen(
                             // Wire recovery before starting so no early decode
                             // error can miss the callback.
                             decoder.onNeedKeyframe = { client.requestKeyframe() }
+                            // Share the clock offset so frame latency can be
+                            // computed from the server's capture timestamps.
+                            decoder.serverClockOffsetUs = client.serverClockOffsetUs
                             isDecoderReady = decoder.configure(
                                 width, height, holder.surface,
                                 refreshRate = displayRefresh
@@ -156,7 +161,12 @@ fun StreamScreen(
                             fontSize = 14.sp
                         )
                         Text(
-                            text = "net ${netLatencyMs}ms \u00b7 decode ${decodeLatencyMs}ms",
+                            text = "frame ${frameLatencyMs}ms \u00b7 net ${netLatencyMs}ms",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = "${"%.1f".format(bitrateMbps)} Mbps \u00b7 dec ${decodeLatencyMs}ms",
                             color = Color.White.copy(alpha = 0.7f),
                             fontSize = 14.sp
                         )

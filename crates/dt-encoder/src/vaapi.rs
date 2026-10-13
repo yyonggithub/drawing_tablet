@@ -21,8 +21,8 @@ pub enum EncoderError {
     #[error("element not found: {0}")]
     ElementNotFound(String),
 
-    #[error("pipeline state change failed")]
-    StateChange,
+    #[error("pipeline state change failed ({0})")]
+    StateChange(String),
 
     #[error("encoding failed: {0}")]
     EncodingFailed(String),
@@ -111,13 +111,17 @@ impl VideoEncoder {
             keyframe = config.keyframe_interval,
         );
 
-        let pipeline = match gst::parse::launch(&nvenc_str) {
+        let mut attempts: Vec<String> = Vec::new();
+
+        let (pipeline, backend) = match gst::parse::launch(&nvenc_str) {
             Ok(p) => {
                 info!("Using NVENC encoder (Direct BGRA upload)");
-                p
+                (p, "nvh264enc")
             }
-            Err(_) => {
-                warn!("NVENC encoder not available, trying VA-API");
+            Err(e) => {
+                attempts.push(format!("nvh264enc: {e}"));
+                warn!("NVENC unavailable ({}), trying VA-API", e);
+
                 // Use vaapipostproc to handle both DMABUF and System memory (upload)
                 let vaapi_str = format!(
                     "appsrc name=src format=time is-live=true do-timestamp=true \
@@ -138,10 +142,12 @@ impl VideoEncoder {
                 match gst::parse::launch(&vaapi_str) {
                     Ok(p) => {
                         info!("Using VA-API encoder");
-                        p
+                        (p, "vaapih264enc")
                     }
-                    Err(_) => {
-                        warn!("VA-API not available, falling back to x264");
+                    Err(e) => {
+                        attempts.push(format!("vaapih264enc: {e}"));
+                        warn!("VA-API unavailable ({}), falling back to x264", e);
+
                         let x264_str = format!(
                             "appsrc name=src format=time is-live=true do-timestamp=true \
                              caps=video/x-raw,format=BGRA,width={width},height={height},framerate={fps}/1 ! \
@@ -156,8 +162,24 @@ impl VideoEncoder {
                             bitrate = config.bitrate,
                             keyframe = config.keyframe_interval,
                         );
-                        gst::parse::launch(&x264_str)
-                            .map_err(|e| EncoderError::PipelineCreation(e.to_string()))?
+
+                        match gst::parse::launch(&x264_str) {
+                            Ok(p) => {
+                                info!("Using x264 software encoder");
+                                (p, "x264enc")
+                            }
+                            Err(e) => {
+                                attempts.push(format!("x264enc: {e}"));
+                                return Err(EncoderError::PipelineCreation(format!(
+                                    "no usable H.264 encoder. Tried: [{}]. \
+                                     NVENC requires a working NVIDIA driver (the loaded kernel \
+                                     module must match the userspace library); VA-API needs its \
+                                     GStreamer plugin (e.g. gst-plugin-va); the software fallback \
+                                     needs gst-plugins-ugly (x264enc).",
+                                    attempts.join("; ")
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -182,9 +204,9 @@ impl VideoEncoder {
         // Start the pipeline
         pipeline
             .set_state(gst::State::Playing)
-            .map_err(|_| EncoderError::StateChange)?;
+            .map_err(|e| EncoderError::StateChange(format!("{backend}: {e}")))?;
 
-        info!("Video encoder pipeline started");
+        info!("Video encoder pipeline started ({backend})");
 
         Ok(Self {
             pipeline,

@@ -22,6 +22,7 @@ use framerate::FramePacer;
 use gui::{DtServerApp, ServerStats};
 use network::{TcpMessage, TcpServer, UdpServer};
 use std::net::SocketAddr;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -39,13 +40,44 @@ struct AvahiService {
 
 impl AvahiService {
     fn start(name: &str, port: u16) -> Option<Self> {
-        Command::new("avahi-publish")
-            .args(["-s", name, "_drawingtablet._udp", &port.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()
-            .map(|child| Self { child })
+        let mut cmd = Command::new("avahi-publish");
+        cmd.args(["-s", name, "_drawingtablet._udp", &port.to_string()]);
+
+        // Publish the LAN address in the TXT record: Android's NSD only hands
+        // clients the IPv6 link-local address for a dual-stack host, which the
+        // server (bound to IPv4) cannot accept.
+        if let Some(ip) = primary_ipv4() {
+            cmd.arg(format!("ip={}", ip));
+        }
+
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+        // Make the advertisement die together with us, even when we exit
+        // without running Drop (window close, SIGKILL, panic). Otherwise a
+        // stale avahi-publish keeps answering mDNS for a server that is gone.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        cmd.spawn().ok().map(|child| Self { child })
+    }
+}
+
+/// The machine's primary LAN IPv4 address, if any.
+///
+/// "Connecting" a UDP socket sends nothing; the kernel just picks the source
+/// address it would use for the default route.
+fn primary_ipv4() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:53").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        ip @ std::net::IpAddr::V4(_) => Some(ip),
+        _ => None,
     }
 }
 
@@ -108,12 +140,21 @@ fn main() -> Result<()> {
         }));
     }
 
-    eframe::run_native(
+    let run_result = eframe::run_native(
         "Drawing Tablet Server",
         native_options,
         Box::new(|_cc| Ok(Box::new(app))),
-    )
-    .map_err(|e| anyhow::anyhow!("Eframe error: {}", e))
+    );
+
+    if let Err(e) = &run_result {
+        error!("Eframe error: {}", e);
+    }
+
+    // Always terminate here: a lingering worker thread must never keep the
+    // process (and, via PR_SET_PDEATHSIG, its avahi helper) alive after the
+    // GUI window is gone.
+    info!("GUI exited; terminating process");
+    std::process::exit(if run_result.is_ok() { 0 } else { 1 });
 }
 
 pub fn run_server_pipeline(
@@ -155,6 +196,14 @@ pub async fn run_server_async(
         "Selected monitor: {}x{} (node {})",
         monitor.width, monitor.height, monitor.node_id
     );
+
+    // The user may have pressed Stop while the portal dialog was open. Bail out
+    // instead of setting up devices and an encoder that are about to be torn
+    // down anyway.
+    if !running.load(Ordering::SeqCst) {
+        info!("Stop requested during startup; aborting before setup");
+        return Ok(());
+    }
 
     {
         let mut guard = stats.lock().unwrap();
@@ -249,6 +298,8 @@ struct StreamCounters {
     sent: AtomicU64,
     fragments: AtomicU64,
     keyframes: AtomicU64,
+    /// Video datagram bytes handed to the socket, reported as bitrate.
+    bytes_sent: AtomicU64,
 }
 
 /// Accumulates "captured -> sent" latency samples (microseconds).
@@ -485,9 +536,12 @@ async fn run_server(
                                         debug!("Heartbeat from client {}", c.tcp_client_id);
                                     }
                                     ControlPacket::Ping => {
-                                        // Echo immediately so the client can
-                                        // estimate the network round trip.
-                                        let pong = encode_control(&ControlPacket::Ping)?;
+                                        // Reply with the server's clock so the
+                                        // client can estimate the clock offset
+                                        // and thus each frame's latency.
+                                        let pong = encode_control(&ControlPacket::Pong {
+                                            server_us: monotonic_us(),
+                                        })?;
                                         let _ = tcp_server.send_to_client(c.tcp_client_id, &pong).await;
                                     }
                                     ControlPacket::SetUdpPort { port } => {
@@ -621,27 +675,41 @@ async fn run_server(
 
         // Update stats once per second
         if last_stats.elapsed() > Duration::from_secs(1) {
+            let captured = stats_captured;
+            let encoded = counters.encoded.swap(0, Ordering::Relaxed);
+            let sent = counters.sent.swap(0, Ordering::Relaxed);
+            let keyframes = counters.keyframes.swap(0, Ordering::Relaxed);
+            let fragments = counters.fragments.swap(0, Ordering::Relaxed);
+            let dropped = stats_dropped_frames;
+            let sent_bytes = counters.bytes_sent.swap(0, Ordering::Relaxed);
+
             {
                 let mut guard = stats.lock().unwrap();
-                guard.captured = stats_captured;
-                guard.encoded = counters.encoded.swap(0, Ordering::Relaxed);
-                guard.dropped = stats_dropped_frames;
-                guard.sent = counters.sent.swap(0, Ordering::Relaxed);
-                guard.keyframes = counters.keyframes.swap(0, Ordering::Relaxed);
-                guard.fragments = counters.fragments.swap(0, Ordering::Relaxed);
+                guard.captured = captured;
+                guard.encoded = encoded;
+                guard.dropped = dropped;
+                guard.sent = sent;
+                guard.keyframes = keyframes;
+                guard.fragments = fragments;
                 guard.errors = stats_encode_errors;
             }
 
-            {
-                let mut latency = latency_stats.lock().unwrap();
-                if let Some(avg) = latency.average_us() {
-                    info!(
-                        "capture->send: avg {:.1} ms, max {:.1} ms",
-                        avg as f64 / 1000.0,
-                        latency.max_us() as f64 / 1000.0
-                    );
-                    latency.reset();
-                }
+            let bitrate_mbps = sent_bytes as f64 * 8.0 / 1_000_000.0;
+            let mut latency = latency_stats.lock().unwrap();
+            let avg = latency.average_us();
+            if avg.is_some() || sent_bytes > 0 || captured > 0 {
+                info!(
+                    "capture->send: avg {:.1} ms, max {:.1} ms, {:.1} Mbps, \
+                     fps cap/enc/sent {}/{}/{}, dropped {}",
+                    avg.unwrap_or(0) as f64 / 1000.0,
+                    latency.max_us() as f64 / 1000.0,
+                    bitrate_mbps,
+                    captured,
+                    encoded,
+                    sent,
+                    dropped
+                );
+                latency.reset();
             }
 
             stats_captured = 0;
@@ -701,6 +769,7 @@ fn video_sender_loop(
         let data = &encoded.data;
         let fragment_count = data.len().div_ceil(MAX_FRAGMENT_DATA) as u16;
         let mut all_sent = true;
+        let mut frame_bytes: u64 = 0;
 
         for i in 0..fragment_count {
             let start = i as usize * MAX_FRAGMENT_DATA;
@@ -722,6 +791,7 @@ fn video_sender_loop(
                         all_sent = false;
                         break;
                     }
+                    frame_bytes += packet_buf.len() as u64;
                 }
                 Err(e) => {
                     warn!("Failed to encode video fragment: {}", e);
@@ -736,6 +806,7 @@ fn video_sender_loop(
             counters
                 .fragments
                 .fetch_add(fragment_count as u64, Ordering::Relaxed);
+            counters.bytes_sent.fetch_add(frame_bytes, Ordering::Relaxed);
         }
         sequence = sequence.wrapping_add(1);
     }

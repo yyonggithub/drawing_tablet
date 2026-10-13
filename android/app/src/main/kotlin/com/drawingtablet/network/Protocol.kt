@@ -131,6 +131,11 @@ sealed class ControlPacket {
      * unchanged (server-side index 8).
      */
     object Ping : ControlPacket()
+    /**
+     * Reply to Ping carrying the server's monotonic clock (µs). Appended after
+     * Ping (server-side index 9).
+     */
+    data class Pong(val serverUs: Long) : ControlPacket()
 }
 
 /**
@@ -319,6 +324,7 @@ object ProtocolCodec {
             }
             3 -> ControlPacket.Heartbeat
             8 -> ControlPacket.Ping
+            9 -> if (buffer.remaining() >= 8) ControlPacket.Pong(buffer.long) else null
             else -> null
         }
     }

@@ -153,6 +153,10 @@ pub enum ControlPacket {
     /// Round-trip probe: the peer echoes it straight back so the sender can
     /// estimate the network latency. Sent by the client; echoed by the server.
     Ping,
+    /// Reply to `Ping` carrying the server's monotonic clock (µs). Lets the
+    /// client estimate the server<->client clock offset and therefore the
+    /// true capture -> display latency of each video frame.
+    Pong { server_us: u64 },
 }
 
 /// A framed packet ready for transmission.

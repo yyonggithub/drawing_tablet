@@ -4,8 +4,10 @@ use eframe::egui;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 #[derive(Clone, Default)]
 pub struct ServerStats {
@@ -50,7 +52,7 @@ pub struct DtServerApp {
     show_help_dialog: bool,
 
     // Runtime and Task
-    rt: Runtime,
+    rt: Option<Runtime>,
     server_task: Option<JoinHandle<()>>,
 }
 
@@ -70,7 +72,7 @@ impl DtServerApp {
             bitrate_input: "8000".to_string(),
             keyframe_input: "120".to_string(),
             show_help_dialog: false,
-            rt,
+            rt: Some(rt),
             server_task: None,
         }
     }
@@ -110,9 +112,13 @@ impl DtServerApp {
         }
 
         // Spawn server task on the existing runtime
-        let task = self.rt.spawn(async move {
+        let task = match self.rt.as_ref() {
+            Some(rt) => rt.spawn(async move {
             // We call run_server_async directly
             if let Err(e) = crate::run_server_async(config, stats.clone(), running.clone()).await {
+                // Also to stdout: the GUI log panel is not visible when the
+                // app is launched from a terminal.
+                error!("Server error: {:#}", e);
                 let mut guard = stats.lock().unwrap();
                 guard.status = format!("Error: {}", e);
                 guard.log(format!("Error: {}", e));
@@ -124,21 +130,56 @@ impl DtServerApp {
             guard.status = "Stopped".to_string();
             guard.connected_client = None;
             guard.log("Server stopped.".to_string());
-        });
+        }),
+            None => {
+                warn!("Tokio runtime is gone; cannot start server");
+                return;
+            }
+        };
 
         self.server_task = Some(task);
     }
 
+    /// Stop the running service. The window stays open so the server can be
+    /// started again; only closing the window terminates the process.
     fn stop_server(&mut self) {
         {
             let mut guard = self.stats.lock().unwrap();
             guard.log("Stopping server...".to_string());
         }
+        info!("STOP SERVER pressed: stopping the service");
         self.running_flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Stop the pipeline and wait (briefly) for it to unwind, so the portal
+    /// stream and the helper processes are released before we exit.
+    fn stop_and_wait(&mut self, timeout_ms: u64) {
+        self.stop_server();
+        if let Some(task) = &self.server_task {
+            let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+            while !task.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        self.server_task = None;
     }
 }
 
 impl eframe::App for DtServerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Window closed: release the pipeline (kills avahi-publish, closes the
+        // portal stream, removes the virtual tablet) before the process exits.
+        info!("GUI window closing: stopping the server pipeline");
+        self.stop_and_wait(500);
+
+        // Consume the runtime with a timeout so a stuck task/thread can never
+        // block the process from exiting.
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_timeout(Duration::from_millis(300));
+        }
+        info!("GUI shutdown complete");
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // --- Theme Configuration (Teal/Green) ---
         let mut visuals = egui::Visuals::dark();
@@ -167,6 +208,7 @@ impl eframe::App for DtServerApp {
 
                 // Ensure flag is false just in case
                 self.running_flag.store(false, Ordering::SeqCst);
+                info!("Server service stopped; ready to start again");
             }
         }
 

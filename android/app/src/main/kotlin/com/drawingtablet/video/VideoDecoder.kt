@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import java.nio.ByteBuffer
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "VideoDecoder"
 private const val MIME_TYPE = "video/avc"
@@ -68,6 +69,9 @@ class VideoDecoder {
     private val _fps = MutableStateFlow(0)
     val fps: StateFlow<Int> = _fps
 
+    /** Frames the decoder could not accept (no input buffer) this second. */
+    private var decodeDrops = 0L
+
     /**
      * Approximate client-side latency: time from a frame finishing arrival to
      * being submitted for display (reassembly + queue + decode). Shown in the
@@ -75,6 +79,21 @@ class VideoDecoder {
      */
     private val _decodeLatencyMs = MutableStateFlow(0)
     val decodeLatencyMs: StateFlow<Int> = _decodeLatencyMs
+
+    /**
+     * End-to-end frame latency: server capture -> submitted for display,
+     * computed from the frame's server timestamp plus the clock offset the
+     * network layer estimated from ping round trips.
+     */
+    private val _frameLatencyMs = MutableStateFlow(0)
+    val frameLatencyMs: StateFlow<Int> = _frameLatencyMs
+
+    /**
+     * `client_clock - server_clock` in µs, published by the network layer.
+     * Null until the first ping round trip has been measured.
+     */
+    @Volatile
+    var serverClockOffsetUs: AtomicLong? = null
 
     /**
      * Configure the decoder with the given dimensions and output surface.
@@ -248,6 +267,7 @@ class VideoDecoder {
             val inputIndex = codec.dequeueInputBuffer(10000) // 10ms timeout
             if (inputIndex < 0) {
                 Log.w(TAG, "No input buffer available for seq=${packet.sequence}")
+                decodeDrops++
                 return
             }
 
@@ -323,20 +343,37 @@ class VideoDecoder {
         framesRendered++
         fpsFrameCount++
 
-        // Update FPS once per second
-        val now = System.nanoTime()
-        if (now - lastFpsTime >= 1_000_000_000L) {
-            _fps.value = fpsFrameCount
-            fpsFrameCount = 0
-            lastFpsTime = now
-        }
-
         // Latency of the frame we actually presented (receipt -> submit).
         pendingReceipts.remove(latestPtsUs)?.let { receivedAtMs ->
             val ageMs = SystemClock.uptimeMillis() - receivedAtMs
             if (ageMs in 0..1000) {
                 _decodeLatencyMs.value = ageMs.toInt()
             }
+        }
+
+        // End-to-end latency: server capture -> submit (needs the clock offset
+        // estimated by the network layer from ping round trips).
+        val offsetUs = serverClockOffsetUs?.get() ?: 0L
+        if (offsetUs != 0L && latestPtsUs > 0) {
+            val nowUs = SystemClock.elapsedRealtimeNanos() / 1000
+            val frameUs = nowUs - latestPtsUs - offsetUs
+            if (frameUs in 0..1_000_000) {
+                _frameLatencyMs.value = (frameUs / 1000).toInt()
+            }
+        }
+
+        // Update FPS and log the stats once per second
+        val now = System.nanoTime()
+        if (now - lastFpsTime >= 1_000_000_000L) {
+            _fps.value = fpsFrameCount
+            fpsFrameCount = 0
+            lastFpsTime = now
+            Log.i(
+                TAG,
+                "frame ${_frameLatencyMs.value}ms, decode ${_decodeLatencyMs.value}ms, " +
+                    "fps ${_fps.value}, decDrop $decodeDrops"
+            )
+            decodeDrops = 0
         }
 
         if (framesRendered <= 5 || framesRendered % 120 == 0) {
