@@ -28,6 +28,29 @@ The result is a Cintiq-like experience on your Android tablet, entirely over WiF
 
 ---
 
+## ⚡ Quick Start
+
+1. **One-time server setup** — load the `uinput` module + udev rule, install
+   `avahi` (mDNS discovery) and an encoder plugin:
+   see [Configuration & Usage → 0](#-configuration--usage).
+2. **Build & run the server:**
+   ```bash
+   cargo build --release --bin dt-server   # or: just build-release
+   ./target/release/dt-server              # or: just run-release
+   ```
+3. In the GUI set **Port** (9999) / **Bitrate** / **Keyframe Int**, press
+   **START SERVER** and pick the screen in the portal dialog.
+4. **Tablet:** install the APK ([Deployment → 4](#4-build--install-the-android-app)),
+   open the app, tap the discovered server (same LAN, prefer **5 GHz**) and draw.
+5. **Stop:** *Stop* stops the service (the window stays open); closing the
+   window exits the process.
+
+Deploy options (Arch PKGBUILD, Nix, `cargo install`, APK signing) are in
+[Deployment](#-deployment); read [Notes & Precautions](#-notes--precautions)
+before exposing anything.
+
+---
+
 ## 🛠️ Prerequisites
 
 ### Linux Server
@@ -157,32 +180,57 @@ devenv shell
 
 ---
 
-## 📦 Compilation & Installation
+## 📦 Deployment
 
-We use [just](https://github.com/casey/just) as a command runner. Install it (optional but recommended) or copy the commands from the `justfile`.
+We use [just](https://github.com/casey/just) as a command runner. It is
+optional — every recipe maps to a plain `cargo` / `gradle` / `adb` command.
 
-### 1. Build the Server
+### 1. Build the server
 ```bash
-# Debug build
-just build
-
-# Release build (Optimized)
-just build-release
+just build            # debug
+just build-release    # optimized (recommended for streaming)
+# or, without `just`:
+cargo build --release --bin dt-server
 ```
 
-### 2. Set up `uinput` (Important!)
+### 2. One-time system setup (Important!)
 
 The server creates the virtual pen/touch devices through the kernel's
 `uinput` module, which needs a one-time setup (load the module, add the udev
 rule, join the group). See **Configuration & Usage → 0.1 `uinput`** below for
 the exact commands — and for the pitfall where `/dev/uinput` exists but the
-module is not loaded.
+module is not loaded. The encoder, mDNS and firewall setup are in
+**0.2–0.4** of the same section.
 
-### 3. Build the Android App
-Open the `android/` directory in Android Studio and hit **Run**, or use the CLI:
-```bash
-just android-deploy
-```
+### 3. Install the server (pick one)
+
+*   **Run from the build tree**: `./target/release/dt-server`
+*   **cargo**: `cargo install --path crates/dt-server` → `~/.cargo/bin/dt-server`
+*   **Arch Linux**: `makepkg -si` with the bundled `PKGBUILD` (release) or
+    `PKGBUILD-git` (latest commit). This installs `/usr/bin/drawing-tablet`
+    plus a "Drawing Tablet" menu entry.
+*   **Nix**: `nix run github:lemonxah/drawing_tablet`, or the flake overlay /
+    Home Manager module — see [Nix / NixOS](#nix--nixos) above.
+
+### 4. Build & install the Android app
+
+*   **Android Studio**: open the `android/` directory and press **Run**.
+*   **CLI** (debug APK to a connected device):
+    ```bash
+    just android-deploy
+    # or:
+    cd android && ./gradlew assembleDebug
+    adb install -r app/build/outputs/apk/debug/app-debug.apk
+    ```
+*   **Release APKs** are signed from `android/drawing_tablet.keystore` with
+    the `KEYSTORE_PASSWORD` / `KEY_PASSWORD` environment variables; without
+    them, build debug APKs.
+
+### 5. Logs
+
+*   The server logs to the terminal (pipeline errors also appear there).
+*   The tablet: `adb logcat -s NetworkClient VideoDecoder ServiceDiscovery`
+    (or `just android-logs`).
 
 ---
 
@@ -391,6 +439,45 @@ command (see [Configuration & Usage](#-configuration--usage)).
 | `just android-logs` | Tail filtered Android logs |
 | `just check-pipewire` | Verify PipeWire status |
 | `just check-vaapi` | Verify Hardware Encoder availability |
+
+---
+
+## ⚠️ Notes & Precautions
+
+**Security**
+*   The protocol is plaintext with **no authentication**, and the server
+    injects input events on your PC. **LAN only** — do not expose the port
+    (9999) beyond your local network.
+*   Don't run the server as root; use the `uinput` udev rule instead.
+
+**Network**
+*   Prefer **5 GHz** WiFi. On 2.4 GHz, airtime queueing alone can add tens of
+    milliseconds of latency.
+*   One tablet at a time — connecting a new tablet replaces the current one.
+*   The Android app has **no manual IP entry**: it only connects to servers
+    found via mDNS, so `avahi-publish` must be running on the server.
+
+**Desktop environment**
+*   The server requires a **Wayland session** with XDG desktop portal and
+    PipeWire (GNOME / KDE / wlroots). Start it from a graphical session, not
+    from a headless SSH shell.
+*   After a GPU driver update, **reboot** before expecting NVENC (the loaded
+    kernel module must match the userspace library). If NVENC still
+    "disappears", clear the GStreamer plugin cache — see Troubleshooting.
+
+**App & version behaviour**
+*   If connection attempts keep failing, the app disables auto-connect
+    ("auto-connect disabled due to unstable connection"). Connect manually
+    once and re-tick "Remember this server".
+*   The encoder order is NVENC → VA-API → x264 (software). The software
+    fallback works but costs CPU and latency — check the server log to see
+    which one you actually got.
+*   The protocol only ever appends new message types, so server and app
+    versions pair loosely: an older app still streams (it just misses the
+    newest stats), and an older server still works (the newer stats read 0).
+*   The measured `frame` latency covers only the video half of the round trip
+    (server capture → tablet display); the pen → PC → drawing-app half
+    happens inside the drawing application — see [Krita Configuration](#krita-configuration).
 
 ---
 

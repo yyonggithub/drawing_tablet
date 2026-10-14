@@ -80,7 +80,7 @@ android-clean:
 
 # View Android logs
 android-logs:
-    adb logcat -s "DrawingTablet:*" "UdpClient:*" "VideoDecoder:*" "InputCapture:*"
+    adb logcat -s "NetworkClient:*" "VideoDecoder:*" "ServiceDiscovery:*"
 
 # === Development ===
 
