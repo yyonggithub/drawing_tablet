@@ -27,6 +27,7 @@ The result is a Cintiq-like experience on your Android tablet, entirely over WiF
 *   **Gesture Support:** Pinch-to-zoom, Pan, and Rotate support in apps like Krita/GIMP (Server-side gesture handling).
 *   **Wayland Native:** Built for modern Linux desktops (GNOME/KDE/Sway).
 *   **Auto-Connect & Self-Healing Discovery:** the client remembers your server, re-scans for it on its own after a restart (Android's mDNS events can be tens of seconds late) and retries the connection politely until it is back.
+*   **One-Click Docker Environment:** develop, compile and package everything (server binary, Arch package, APK) inside container images — no host toolchain needed.
 
 ---
 
@@ -47,13 +48,19 @@ The result is a Cintiq-like experience on your Android tablet, entirely over WiF
 5. **Stop:** *Stop* stops the service (the window stays open); closing the
    window exits the process.
 
-Deploy options (Arch PKGBUILD, Nix, `cargo install`, APK signing) are in
-[Deployment](#-deployment); read [Notes & Precautions](#-notes--precautions)
-before exposing anything.
+Deploy options (Arch PKGBUILD, Nix, `cargo install`, APK signing, the
+[Docker one-click environment](#6-docker-one-click-dev--build--package))
+are in [Deployment](#-deployment); read
+[Notes & Precautions](#-notes--precautions) before exposing anything.
 
 ---
 
 ## 🛠️ Prerequisites
+
+> **No toolchain on the host?** Everything below (Rust, GStreamer headers,
+> Android SDK) ships in the [Docker one-click
+> environment](#6-docker-one-click-dev--build--package) — jump to
+> [Deployment → 6](#6-docker-one-click-dev--build--package) instead.
 
 ### Linux Server
 You need a modern Linux distribution running **Wayland**.
@@ -466,7 +473,10 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 ## 📜 Justfile Commands
 
 `just` is optional — every recipe maps to a plain `cargo`/`gradle`/`adb`
-command (see [Configuration & Usage](#-configuration--usage)).
+command (see [Configuration & Usage](#-configuration--usage)); the
+`docker-*` recipes wrap the [Docker one-click
+environment](#6-docker-one-click-dev--build--package) (run
+`./docker/dt.sh …` directly if you don't have `just`).
 
 | Command | Description |
 | :--- | :--- |
@@ -477,6 +487,11 @@ command (see [Configuration & Usage](#-configuration--usage)).
 | `just android-logs` | Tail filtered Android logs |
 | `just check-pipewire` | Verify PipeWire status |
 | `just check-vaapi` | Verify Hardware Encoder availability |
+| `just docker-image [server\|android\|all]` | Build the Docker image(s) |
+| `just docker-dev [server\|android]` | Interactive Docker dev shell (source at `/src`) |
+| `just docker-build [server\|android]` | Compile inside Docker |
+| `just docker-package` | Package the server into `dist/` (bin + tarball + Arch pkg) |
+| `just docker-apk` | Build the APK into `dist/` |
 
 ---
 

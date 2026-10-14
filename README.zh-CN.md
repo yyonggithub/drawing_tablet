@@ -27,6 +27,7 @@
 *   **手势支持：** 在 Krita/GIMP 等应用中支持双指缩放、平移、旋转（服务端处理手势）。
 *   **Wayland 原生：** 面向现代 Linux 桌面（GNOME/KDE/Sway）。
 *   **自动重连与自愈发现：** 客户端会记住你的服务器，重启后自动重新扫描发现（Android 的 mDNS 事件可能迟到数十秒）并以合理节奏重试连接，直到恢复。
+*   **Docker 一键环境：** 开发、编译、打包（服务端二进制、Arch 包、APK）全部可在容器镜像内完成——宿主机无需安装工具链。
 
 ---
 
@@ -45,12 +46,17 @@
    打开 App，点击发现的服务器（同一局域网，优先 **5 GHz**）即可开始绘制。
 5. **停止：** *Stop* 只停止服务（窗口保留）；关闭窗口才会退出进程。
 
-部署方式（Arch PKGBUILD、Nix、`cargo install`、APK 签名）见[部署](#-部署)；
+部署方式（Arch PKGBUILD、Nix、`cargo install`、APK 签名、
+[Docker 一键环境](#6-docker-一键环境开发--编译--打包)）见[部署](#-部署)；
 在任何对外暴露之前，请先阅读[注意事项](#-注意事项)。
 
 ---
 
 ## 🛠️ 前置依赖
+
+> **宿主机不想装工具链？** 下面这些东西（Rust、GStreamer 头文件、
+> Android SDK）都在 [Docker 一键环境](#6-docker-一键环境开发--编译--打包)
+> 里——直接看[部署 → 6](#6-docker-一键环境开发--编译--打包) 即可。
 
 ### Linux 服务端
 你需要一个运行 **Wayland** 的现代 Linux 发行版。
@@ -453,7 +459,9 @@ capture->send: avg 1.1 ms, max 2.0 ms, 3.6 Mbps, fps cap/enc/sent 60/60/58, drop
 ## 📜 Justfile 命令
 
 `just` 是可选的——每条 recipe 都对应普通的 `cargo`/`gradle`/`adb`
-命令（见[配置与使用](#-配置与使用)）。
+命令（见[配置与使用](#-配置与使用)）；`docker-*` 系列 recipe 封装的是
+[Docker 一键环境](#6-docker-一键环境开发--编译--打包)（没装 `just`
+就直接跑 `./docker/dt.sh …`）。
 
 | 命令 | 说明 |
 | :--- | :--- |
@@ -464,6 +472,11 @@ capture->send: avg 1.1 ms, max 2.0 ms, 3.6 Mbps, fps cap/enc/sent 60/60/58, drop
 | `just android-logs` | 实时查看过滤后的 Android 日志 |
 | `just check-pipewire` | 检查 PipeWire 状态 |
 | `just check-vaapi` | 检查硬件编码器可用性 |
+| `just docker-image [server\|android\|all]` | 构建 Docker 镜像 |
+| `just docker-dev [server\|android]` | 进入 Docker 开发 shell（源码挂载 `/src`） |
+| `just docker-build [server\|android]` | 容器内编译 |
+| `just docker-package` | 容器内打包服务端 → `dist/`（二进制 + tarball + Arch 包） |
+| `just docker-apk` | 容器内出 APK → `dist/` |
 
 ---
 
