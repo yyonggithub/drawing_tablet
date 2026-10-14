@@ -2,6 +2,8 @@
 
 A high-performance, low-latency drawing tablet solution that turns your Android device into a professional graphics tablet for Linux (Wayland).
 
+**English** | [简体中文](README.zh-CN.md)
+
 ## 🚀 Overview
 
 Check out the [Official website](https://lemonxah.github.io/drawing_tablet/)
@@ -24,7 +26,7 @@ The result is a Cintiq-like experience on your Android tablet, entirely over WiF
 *   **Full Wacom Emulation:** Supports Pressure, Tilt, and Hover.
 *   **Gesture Support:** Pinch-to-zoom, Pan, and Rotate support in apps like Krita/GIMP (Server-side gesture handling).
 *   **Wayland Native:** Built for modern Linux desktops (GNOME/KDE/Sway).
-*   **Auto-Connect:** Client remembers your server and handles network interruptions gracefully.
+*   **Auto-Connect & Self-Healing Discovery:** the client remembers your server, re-scans for it on its own after a restart (Android's mDNS events can be tens of seconds late) and retries the connection politely until it is back.
 
 ---
 
@@ -329,6 +331,8 @@ tablet reports (a 60 Hz panel is streamed at ≤ 60 fps).
 2.  Tablet and PC on the **same LAN — prefer 5 GHz**.
 3.  Open the app: the server appears in the list (mDNS). Tap it to connect.
     *   *Optional:* tick **"Remember this server"** to auto-connect later.
+    *   If you restart the server later, the app re-discovers and reconnects
+        on its own within seconds.
 
 ### 3. Draw
 
