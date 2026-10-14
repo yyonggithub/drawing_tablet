@@ -20,6 +20,11 @@ import com.drawingtablet.ui.StreamScreen
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
+/** Minimum gap between automatic reconnection attempts. */
+private const val AUTO_RETRY_COOLDOWN_MS = 3_000L
+
+private const val TAG = "MainActivity"
+
 class MainActivity : ComponentActivity() {
     private var client: NetworkClient? = null
     private lateinit var serviceDiscovery: ServiceDiscovery
@@ -71,9 +76,6 @@ class MainActivity : ComponentActivity() {
         
         val context = androidx.compose.ui.platform.LocalContext.current
         val prefs = remember { PreferencesManager(context) }
-        
-        // Safety: Track rapid disconnects to prevent loops
-        var disconnectCount by remember { mutableIntStateOf(0) }
 
         fun connectTo(address: String, port: Int) {
             // Close existing client if any
@@ -92,9 +94,18 @@ class MainActivity : ComponentActivity() {
         }
 
         // Auto-connect logic (Triggers on app start or recovery)
+        var nextAutoAttemptAt by remember { mutableLongStateOf(0L) }
         LaunchedEffect(discoveredServers, currentClient) {
             // Only auto-connect if no client exists AND auto-connect is enabled
             if (currentClient == null && prefs.shouldAutoConnect) {
+                // Cooldown so a server that is listed but not accepting
+                // connections is retried politely, not hammered.
+                val waitMs = nextAutoAttemptAt - System.currentTimeMillis()
+                if (waitMs > 0) {
+                    android.util.Log.i(TAG, "auto-connect: cooling down ${waitMs}ms")
+                    kotlinx.coroutines.delay(waitMs)
+                }
+
                 val savedHost = prefs.rememberedServerHost
                 val savedPort = prefs.rememberedServerPort
                 if (savedHost != null) {
@@ -105,32 +116,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        
-        // Connection Monitoring: Reset count on stable connection, Disable auto-connect on loops
+
+        // Drop the dead client so the auto-connect effect above can retry.
+        // The retry rate is bounded by ServiceDiscovery's refresh cycle (one
+        // attempt per list emission), so the app recovers on its own after a
+        // server restart instead of latching into a permanently disabled
+        // state (the old "auto-connect disabled after 3 failures" behaviour).
         LaunchedEffect(connectionState) {
             when (connectionState) {
-                is ConnectionState.Connected -> {
-                    // If we stay connected for 5 seconds, reset the error count
-                    kotlinx.coroutines.delay(5000)
-                    disconnectCount = 0
-                }
                 is ConnectionState.Disconnected, is ConnectionState.Error -> {
-                    // If we were trying to connect (client exists) and failed
                     if (currentClient != null) {
-                        disconnectCount++
-                        
-                        if (disconnectCount >= 3) {
-                            prefs.shouldAutoConnect = false
-                            disconnectCount = 0
-                            android.widget.Toast.makeText(
-                                context, 
-                                "Auto-connect disabled due to unstable connection", 
-                                android.widget.Toast.LENGTH_LONG
-                            ).show()
-                        }
-                        
-                        // Reset client to allow retry (if not disabled)
-                        // This enables the "Auto-reconnect" behavior
+                        nextAutoAttemptAt = System.currentTimeMillis() + AUTO_RETRY_COOLDOWN_MS
                         currentClient = null
                     }
                 }

@@ -466,9 +466,12 @@ command (see [Configuration & Usage](#-configuration--usage)).
     "disappears", clear the GStreamer plugin cache — see Troubleshooting.
 
 **App & version behaviour**
-*   If connection attempts keep failing, the app disables auto-connect
-    ("auto-connect disabled due to unstable connection"). Connect manually
-    once and re-tick "Remember this server".
+*   The app re-scans for servers on its own (every few seconds while none is
+    known) because Android's mDNS events can be tens of seconds late or lost
+    after a server restart. Failed connection attempts are retried politely
+    with a cooldown — the app never latches into a state where it stops
+    trying; if it spins on "Looking for drawing tablet server", the server
+    really is not advertising (check `avahi-publish`).
 *   The encoder order is NVENC → VA-API → x264 (software). The software
     fallback works but costs CPU and latency — check the server log to see
     which one you actually got.
