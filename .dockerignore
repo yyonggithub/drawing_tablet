@@ -1,0 +1,13 @@
+# Build artifacts / VCS are irrelevant to the image builds (the images are
+# pure toolchain environments — sources are bind-mounted at run time).
+.git
+target
+dist
+android/app/build
+android/build
+android/.gradle
+android/local.properties
+android/.idea
+.idea
+.commandcode
+*.log

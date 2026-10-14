@@ -234,6 +234,40 @@ module is not loaded. The encoder, mDNS and firewall setup are in
 *   The tablet: `adb logcat -s NetworkClient VideoDecoder ServiceDiscovery`
     (or `just android-logs`).
 
+### 6. Docker one-click (dev / build / package)
+
+If you don't want to install the toolchain on the host, everything can also
+be built inside Docker. The images cover **development, compilation and
+packaging only** — the server itself must still run on the host (Wayland
+portals, PipeWire and uinput are not available inside a container).
+
+```bash
+./docker/dt.sh image [server|android|all]   # (re)build the image(s) on demand
+./docker/dt.sh dev   [server|android]       # interactive shell, source at /src
+./docker/dt.sh build [server|android]       # compile into the worktree
+./docker/dt.sh package                      # server -> dist/
+./docker/dt.sh apk                          # Android APK -> dist/
+```
+
+Equivalent recipes (if you have [`just`](https://github.com/casey/just)
+installed): `just docker-image [server|android|all]`, `just docker-dev …`,
+`just docker-build …`, `just docker-package`, `just docker-apk`.
+
+*   **Two images:** `drawing-tablet-server:local` (Arch, Rust + GStreamer,
+    `clang21` pinned for the bindgen/libclang pitfall) and
+    `drawing-tablet-android:local` (Arch, JDK 21 + Android SDK platform-35 —
+    no NDK, the app is pure Kotlin/Compose).
+*   **Caches:** `dt-cargo-registry` and `dt-gradle-home` are named volumes;
+    `target/` and the Gradle build dirs stay in the worktree, so rebuilds are
+    incremental and artifacts remain visible on the host.
+*   `package` produces three artifacts in `dist/`: the release binary, a
+    versioned tarball (binary + `.desktop` + icon + license + READMEs) and an
+    Arch package built from your **current working tree** with the repo's
+    PKGBUILD (its `source=` is switched to a local tarball).
+*   `apk` produces `dist/drawing-tablet-<version>-debug.apk`; export
+    `KEYSTORE_PASSWORD`/`KEY_PASSWORD` and provide
+    `android/drawing_tablet.keystore` to get a release APK instead.
+
 ---
 
 ## 🚀 Configuration & Usage

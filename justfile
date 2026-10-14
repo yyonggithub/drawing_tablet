@@ -122,3 +122,25 @@ clean-all: clean android-clean
 
 # Full release build
 release: build-release android-build-release
+
+# === Docker one-click environment (dev / build / package) ===
+
+# Build the Docker image(s): server | android | all
+docker-image t="server":
+    ./docker/dt.sh image {{t}}
+
+# Interactive dev shell in Docker (source mounted at /src)
+docker-dev t="server":
+    ./docker/dt.sh dev {{t}}
+
+# Compile inside Docker (artifacts land in the worktree)
+docker-build t="server":
+    ./docker/dt.sh build {{t}}
+
+# Package the server in Docker: binary + tarball + Arch package -> dist/
+docker-package:
+    ./docker/dt.sh package
+
+# Build the Android APK in Docker -> dist/
+docker-apk:
+    ./docker/dt.sh apk

@@ -1,0 +1,37 @@
+# Development / build environment for the Rust server.
+#
+# BUILD ONLY — the server itself must run on the host: Wayland screen-capture
+# portals, PipeWire and uinput are not available inside a container.
+FROM archlinux:base-devel
+
+# libspa-sys (bindgen 0.69) is incompatible with libclang >= 22: it renders
+# forward-declared-then-defined structs (e.g. `spa_pod_builder`) as opaque
+# types and breaks the build. clang21 ships libclang 21 under
+# /usr/lib/llvm21/lib — pin bindgen to it here so the image does not depend
+# on any host-side .cargo/config.toml.
+ENV LIBCLANG_PATH=/usr/lib/llvm21/lib
+
+# Toolchain + everything the PKGBUILD declares as depends/makedepends, so
+# `makepkg` dependency checks pass inside the container too.
+RUN pacman -Syu --noconfirm --needed \
+        rust \
+        clang clang21 llvm21-libs pkgconf \
+        pipewire libpipewire gstreamer gst-plugins-base gst-plugins-good \
+        gst-plugins-bad gst-plugins-ugly gst-plugin-va \
+        xdg-desktop-portal avahi hicolor-icon-theme \
+        git tar gzip sudo just \
+    && rm -rf /var/cache/pacman/pkg/*
+
+# Non-root builder matching the host uid (artifacts written into the
+# bind-mounted worktree keep host ownership). Cache dirs are pre-created so
+# the named volumes initialize with the right ownership.
+ARG UID=1000
+RUN useradd -m -u "${UID}" -s /bin/bash builder \
+    && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder \
+    && chmod 440 /etc/sudoers.d/builder \
+    && install -d -o builder -g builder /home/builder/.cargo /home/builder/.gradle
+
+ENV HOME=/home/builder
+USER builder
+WORKDIR /src
+CMD ["bash", "-l"]

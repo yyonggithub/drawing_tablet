@@ -1,0 +1,40 @@
+# Development / build environment for the Android client.
+#
+# BUILD ONLY — the APK runs on the tablet. No NDK on purpose: the app is pure
+# Kotlin/Compose with no native code.
+FROM archlinux:base-devel
+
+ARG CMDLINE_TOOLS_URL=https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+
+ENV ANDROID_HOME=/opt/android-sdk
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+ENV PATH="$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin"
+
+# JDK + Android cmdline-tools, then the components this project needs
+# (compileSdk 35, AGP 8.7 default build-tools 34.0.0 / 35.0.0).
+RUN pacman -Syu --noconfirm --needed \
+        jdk21-openjdk curl git unzip zip which sudo \
+    && mkdir -p /opt/android-sdk/cmdline-tools \
+    && curl -fsSL "$CMDLINE_TOOLS_URL" -o /tmp/cmdline-tools.zip \
+    && unzip -q /tmp/cmdline-tools.zip -d /opt/android-sdk/cmdline-tools \
+    && mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest \
+    && rm /tmp/cmdline-tools.zip \
+    && yes | /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null \
+    && /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+        "platform-tools" "platforms;android-35" \
+        "build-tools;34.0.0" "build-tools;35.0.0" \
+    && rm -rf /opt/android-sdk/.temp /opt/android-sdk/downloads /root/.android
+
+# Non-root builder matching the host uid; the SDK is owned by builder so
+# Gradle can auto-install anything missing at build time.
+ARG UID=1000
+RUN useradd -m -u "${UID}" -s /bin/bash builder \
+    && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder \
+    && chmod 440 /etc/sudoers.d/builder \
+    && install -d -o builder -g builder /home/builder/.cargo /home/builder/.gradle \
+    && chown -R builder:builder /opt/android-sdk
+
+ENV HOME=/home/builder
+USER builder
+WORKDIR /src
+CMD ["bash", "-l"]

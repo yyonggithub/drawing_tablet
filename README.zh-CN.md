@@ -228,6 +228,39 @@ cargo build --release --bin dt-server
 *   平板端：`adb logcat -s NetworkClient VideoDecoder ServiceDiscovery`
     （或 `just android-logs`）。
 
+### 6. Docker 一键环境（开发 / 编译 / 打包）
+
+不想在宿主机装工具链的话，全部构建都可以放进 Docker。镜像只负责
+**开发、编译和打包**——服务端本身仍必须跑在宿主机上（容器里没有
+Wayland 门户、PipeWire 和 uinput）。
+
+```bash
+./docker/dt.sh image [server|android|all]   # 按需（重）构建镜像
+./docker/dt.sh dev   [server|android]       # 交互式开发 shell，源码挂载在 /src
+./docker/dt.sh build [server|android]       # 容器内编译（产物在工作区）
+./docker/dt.sh package                      # 服务端 → dist/
+./docker/dt.sh apk                          # Android APK → dist/
+```
+
+等价的 `just` recipe（需安装 [`just`](https://github.com/casey/just)）：
+`just docker-image [server|android|all]`、`just docker-dev …`、
+`just docker-build …`、`just docker-package`、`just docker-apk`。
+
+*   **两个镜像：** `drawing-tablet-server:local`（Arch，Rust + GStreamer，
+    固定 `clang21` 规避 bindgen/libclang 坑）和
+    `drawing-tablet-android:local`（Arch，JDK 21 + Android SDK
+    platform-35——不装 NDK，应用是纯 Kotlin/Compose）。
+*   **缓存：** `dt-cargo-registry`、`dt-gradle-home` 为命名卷；
+    `target/` 与 Gradle 构建目录留在工作区里，重复构建走增量、
+    产物在宿主机直接可见。
+*   `package` 在 `dist/` 产出三件套：release 二进制、带版本号的 tarball
+    （二进制 + `.desktop` + 图标 + 许可证 + 双语 README）、以及用仓库
+    PKGBUILD 基于**当前工作区代码**构建的 Arch 包（`source=` 已切换为
+    本地 tarball）。
+*   `apk` 产出 `dist/drawing-tablet-<版本>-debug.apk`；导出
+    `KEYSTORE_PASSWORD`/`KEY_PASSWORD` 并提供
+    `android/drawing_tablet.keystore` 则出 release APK。
+
 ---
 
 ## 🚀 配置与使用
