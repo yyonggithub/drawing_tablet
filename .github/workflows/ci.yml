@@ -1,0 +1,75 @@
+# Continuous integration: compile + test on every push/PR.
+#
+# Everything runs inside the project's Docker images so CI matches the
+# locally verified `docker/dt.sh` path exactly (see README "Docker
+# one-click"). Images are layer-cached via the GitHub Actions cache backend
+# with fixed scopes shared between this workflow and release.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-test:
+    name: Server (cargo test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Match the container builder to the runner uid so everything written
+      # into the bind-mounted worktree (target/, logs) keeps runner
+      # ownership for later steps.
+      - name: Container uid
+        id: uid
+        run: echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build server image (layer cache, scope shared with release.yml)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          tags: drawing-tablet-server:local
+          load: true
+          build-args: UID=${{ steps.uid.outputs.uid }}
+          cache-from: type=gha,scope=dt-server-image
+          cache-to: type=gha,mode=max,scope=dt-server-image
+
+      - name: cargo test --workspace
+        run: ./docker/dt.sh test server
+
+  android-build:
+    name: Android (debug APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Container uid
+        id: uid
+        run: echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build android image (layer cache, scope shared with release.yml)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.android
+          tags: drawing-tablet-android:local
+          load: true
+          build-args: UID=${{ steps.uid.outputs.uid }}
+          cache-from: type=gha,scope=dt-android-image
+          cache-to: type=gha,mode=max,scope=dt-android-image
+
+      - name: Assemble debug APK
+        run: ./docker/dt.sh build android

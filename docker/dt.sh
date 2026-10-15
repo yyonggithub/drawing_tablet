@@ -10,6 +10,7 @@
 #   ./docker/dt.sh image  [server|android|all]  build the image(s)
 #   ./docker/dt.sh dev    [server|android]      interactive shell, source at /src
 #   ./docker/dt.sh build  [server|android]      compile (artifacts in worktree)
+#   ./docker/dt.sh test   [server|android]      run tests (cargo test / gradle unit tests)
 #   ./docker/dt.sh package                      server: bin + tarball + Arch pkg -> dist/
 #   ./docker/dt.sh apk                          Android APK -> dist/
 #
@@ -31,7 +32,7 @@ die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 usage() {
-    sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- image handling -----------------------------------------------------------
@@ -139,6 +140,22 @@ cmd_build() {
     esac
 }
 
+cmd_test() {
+    case "${1:-server}" in
+        server)
+            ensure_image server
+            info "cargo test --workspace"
+            run_server 'cargo test --workspace'
+            ;;
+        android)
+            ensure_image android
+            info "gradle testDebugUnitTest (no unit tests yet - green no-op until they exist)"
+            run_android 'cd android && ./gradlew testDebugUnitTest'
+            ;;
+        *) die "unknown target '$1' (want: server | android)" ;;
+    esac
+}
+
 cmd_package() {
     ensure_image server
     local pkgver work stage tarball
@@ -152,7 +169,7 @@ cmd_package() {
     info "1/4 cargo build --release"
     run_server 'cargo build --release'
 
-    info "2/4 dist/dt-server + dist/drawing-tablet-$pkgver-linux-x86_64.tar.gz"
+    info "2/4 dist/drawing-tablet-$pkgver-linux-x86_64.tar.gz"
     stage="$work/stage/drawing-tablet-$pkgver-linux-x86_64"
     mkdir -p "$stage"
     cp -f target/release/dt-server "$stage/drawing-tablet"
@@ -215,6 +232,7 @@ case "$cmd" in
     image)   cmd_image "${1:-server}" ;;
     dev)     cmd_dev "${1:-server}" ;;
     build)   cmd_build "${1:-server}" ;;
+    test)    cmd_test "${1:-server}" ;;
     package) cmd_package ;;
     apk)     cmd_apk ;;
     help|-h|--help) usage ;;

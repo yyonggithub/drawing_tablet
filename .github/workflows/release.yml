@@ -1,0 +1,131 @@
+# Release: push a `v*` tag -> build all artifacts -> create a GitHub
+# Release with the binaries attached.
+#
+# Artifacts (all produced by the same `docker/dt.sh` scripts used locally):
+#   - drawing-tablet-<ver>-linux-x86_64.tar.gz   (server binary bundle)
+#   - drawing-tablet-<ver>-<rel>-x86_64.pkg.tar.zst  (Arch package; its
+#     makepkg check() runs `cargo test` as part of packaging)
+#   - drawing-tablet-<versionName>-<debug|release>.apk
+#
+# Release APK signing is optional: provide the ANDROID_KEYSTORE_B64
+# (base64 of android/drawing_tablet.keystore) plus KEYSTORE_PASSWORD and
+# KEY_PASSWORD secrets, otherwise a debug APK is attached.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  server-package:
+    name: Server package (binary + tarball + Arch pkg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Container uid
+        id: uid
+        run: echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build server image (layer cache, scope shared with ci.yml)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          tags: drawing-tablet-server:local
+          load: true
+          build-args: UID=${{ steps.uid.outputs.uid }}
+          cache-from: type=gha,scope=dt-server-image
+          cache-to: type=gha,mode=max,scope=dt-server-image
+
+      - name: Package (binary + tarball + Arch package via makepkg)
+        run: ./docker/dt.sh package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-dist
+          path: |
+            dist/*.tar.gz
+            dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  android-apk:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Container uid
+        id: uid
+        run: echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore release keystore when secrets exist
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d > android/drawing_tablet.keystore
+            echo "Keystore restored - a signed release APK will be built."
+          else
+            echo "No ANDROID_KEYSTORE_B64 secret - a debug APK will be built."
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build android image (layer cache, scope shared with ci.yml)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.android
+          tags: drawing-tablet-android:local
+          load: true
+          build-args: UID=${{ steps.uid.outputs.uid }}
+          cache-from: type=gha,scope=dt-android-image
+          cache-to: type=gha,mode=max,scope=dt-android-image
+
+      - name: Build APK (release when keystore + passwords exist, else debug)
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./docker/dt.sh apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [server-package, android-apk]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach artifacts and generate release notes
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.pkg.tar.zst
+            dist/*.apk
