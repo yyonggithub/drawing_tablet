@@ -113,10 +113,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      # Download only OUR artifacts by name - the buildx `type=gha` cache
+      # backend stores its layer cache as run-scoped `*.dockerbuild`
+      # artifacts too, which a name-less download would grab (and fail on).
+      - name: Download server artifacts
+        uses: actions/download-artifact@v4
         with:
+          name: server-dist
           path: dist
-          merge-multiple: true
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: dist
 
       - name: Attach artifacts and generate release notes
         uses: softprops/action-gh-release@v2
