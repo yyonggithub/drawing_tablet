@@ -2,6 +2,10 @@ target
 dist
 *.log
 
+# Local cargo config (per-machine LIBCLANG_PATH etc. — see README
+# Troubleshooting; committing it would break builds on other machines)
+.cargo/
+
 # Android
 android/.gradle/
 android/build/
