@@ -48,19 +48,20 @@ pub enum TabletError {
 }
 
 /// Map a uinput error, adding an actionable hint for the common permission
-/// failure (missing udev rule / group membership).
+/// failure (missing module / missing udev rule).
 fn device_creation_error(e: std::io::Error) -> TabletError {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         return TabletError::DeviceCreation(std::io::Error::new(
             e.kind(),
-            format!(
-                "{e}. Cannot open /dev/uinput. Load the module (`sudo modprobe uinput`) \
-                 and make the device writable by your user: udev rule \
-                 `KERNEL==\"uinput\", GROUP=\"uinput\", MODE=\"0660\"`, join the \
-                 `uinput` group, then run \
-                 `sudo udevadm control --reload-rules && sudo udevadm trigger \
-                 --action=add --name-match=uinput`."
-            ),
+            "permission denied opening /dev/uinput. Load the module if the \
+             node is a leftover (`sudo modprobe uinput`), then allow non-root \
+             access with udev rule `KERNEL==\"uinput\", MODE=\"0666\"` (the \
+             Arch package ships it as \
+             /usr/lib/udev/rules.d/70-drawing-tablet-uinput.rules), and run \
+             `sudo udevadm control --reload-rules && sudo udevadm trigger \
+             --action=change --name-match=uinput`. Note: a GROUP= rule is \
+             NOT reliable - brltty's udev setfacl can bake `group::---` into \
+             the ACL on boot.",
         ));
     }
     TabletError::DeviceCreation(e)

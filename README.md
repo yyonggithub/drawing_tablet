@@ -283,32 +283,42 @@ installed): `just docker-image [server|android|all]`, `just docker-dev …`,
 
 #### 0.1 `uinput` — virtual tablet (required)
 
-Pen/touch events are injected through the kernel's `uinput` module, which must
-be **loaded** and its device node **writable by your user**:
+Pen/touch events are injected through the kernel's `uinput` module.
+
+**The Arch package sets this up automatically** — it ships
+`/usr/lib/udev/rules.d/70-drawing-tablet-uinput.rules` and reloads udev on
+install. For a manual/tarball install:
 
 ```bash
 sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf   # load it at boot
 
-sudo groupadd -f uinput
 sudo tee /etc/udev/rules.d/99-drawing-tablet.rules >/dev/null <<'EOF'
-KERNEL=="uinput", GROUP="uinput", MODE="0660"
+KERNEL=="uinput", MODE="0666"
 EOF
-sudo usermod -aG uinput "$USER"           # log out / back in afterwards
 sudo udevadm control --reload-rules
-sudo udevadm trigger --action=add --name-match=uinput
+sudo udevadm trigger --action=change --name-match=uinput
 ```
 
-Verify (want `crw-rw---- root uinput`):
+Verify (want `crw-rw-rw-`, i.e. openable by any user):
 
 ```bash
 ls -l /dev/uinput
 ```
 
+> **Why `MODE="0666"` instead of a `GROUP=` rule?** The brltty package ships a
+> udev rule that runs `setfacl` on `/dev/uinput`; when that races a freshly
+> created node at boot it bakes `group::---` into the POSIX ACL, and a later
+> udev `MODE=` can only update the ACL *mask* — group membership silently
+> stops working after a reboot. The `other` class is not part of any ACL, so
+> `MODE="0666"` is the reliable variant. (On a multi-user machine weigh the
+> trade-off: every local account can then inject input events.)
+
 > **Pitfall:** if `/dev/uinput` shows `crw------- root root` **and**
 > `lsmod | grep uinput` prints nothing, the module is not loaded and the node
-> is a leftover — udev never sees it, so the udev rule cannot help. Run
-> `sudo modprobe uinput` first, then re-trigger udev.
+> is a leftover — the kernel denies the open before it would autoload the
+> module, so udev cannot help. Run `sudo modprobe uinput` first, then
+> re-trigger udev.
 
 #### 0.2 Encoder (one of the three; the server auto-detects)
 
@@ -540,11 +550,19 @@ environment](#6-docker-one-click-dev--build--package) (run
 ## ❓ Troubleshooting
 
 **Q: The server fails right after Start with "Cannot open /dev/uinput" / "Failed to create virtual device".**
-*   The `uinput` module is not loaded or the node is not writable. See the
-    one-time `uinput` setup in **Configuration & Usage → 0.1** above:
-    `sudo modprobe uinput`, the udev rule, and membership in the `uinput`
-    group. If `/dev/uinput` is `crw------- root root` while
-    `lsmod | grep uinput` is empty, the module is simply not loaded.
+*   The `uinput` module is not loaded or the node is not writable by your
+    user. See **Configuration & Usage → 0.1** above:
+    *   **Arch package** (`pkgrel ≥ 2`): the udev rule is installed
+        automatically — just upgrade (`sudo pacman -U …`). If it still fails,
+        `sudo modprobe uinput && sudo udevadm trigger --action=change --name-match=uinput`.
+    *   **Manual / tarball**: `sudo modprobe uinput`, then the
+        `KERNEL=="uinput", MODE="0666"` udev rule + reload/trigger as shown
+        in 0.1.
+    If `/dev/uinput` is `crw------- root root` while `lsmod | grep uinput`
+    is empty, the module is simply not loaded.
+    *   Previously created a `GROUP=` rule in `/etc/udev/rules.d/`? Delete
+        it — udev applies `/etc` rules last, so its `MODE="0660"` would undo
+        the fix.
     (Running the server with `sudo` also works but is not recommended.)
 
 **Q: The server reports "no usable H.264 encoder".**

@@ -175,6 +175,7 @@ cmd_package() {
     cp -f target/release/dt-server "$stage/drawing-tablet"
     cp -f drawing-tablet.desktop "$stage/"
     cp -f crates/dt-server/assets/icon.png "$stage/"
+    cp -f pkg/70-drawing-tablet-uinput.rules "$stage/"
     cp -f LICENSE README.md README.zh-CN.md "$stage/"
     tarball="$DIST/drawing-tablet-$pkgver-linux-x86_64.tar.gz"
     tar -czf "$tarball" -C "$work/stage" "drawing-tablet-$pkgver-linux-x86_64"
@@ -189,6 +190,7 @@ cmd_package() {
         --exclude='./android/.gradle' --exclude='./.commandcode' \
         ./.
     sed 's|^source=.*|source=("$pkgname-$pkgver.tar.gz")|' PKGBUILD > "$work/PKGBUILD"
+    cp -f pkg/drawing-tablet.install "$work/"
 
     info "4/4 makepkg (release build + tests + Arch package)"
     run_server 'makepkg -f --noconfirm' "/src/dist/.pkgbuild"

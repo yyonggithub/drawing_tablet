@@ -275,31 +275,38 @@ Wayland 门户、PipeWire 和 uinput）。
 
 #### 0.1 `uinput` —— 虚拟平板（必需）
 
-笔/触摸事件通过内核的 `uinput` 模块注入，该模块必须**已加载**，
-且设备节点**对你的用户可写**：
+笔/触摸事件通过内核的 `uinput` 模块注入。
+
+**Arch 包会自动完成全部配置**——它自带
+`/usr/lib/udev/rules.d/70-drawing-tablet-uinput.rules`，安装时自动重载 udev。
+手动安装（tarball）时：
 
 ```bash
 sudo modprobe uinput
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf   # 开机自动加载
 
-sudo groupadd -f uinput
 sudo tee /etc/udev/rules.d/99-drawing-tablet.rules >/dev/null <<'EOF'
-KERNEL=="uinput", GROUP="uinput", MODE="0660"
+KERNEL=="uinput", MODE="0666"
 EOF
-sudo usermod -aG uinput "$USER"           # 之后需要重新登录
 sudo udevadm control --reload-rules
-sudo udevadm trigger --action=add --name-match=uinput
+sudo udevadm trigger --action=change --name-match=uinput
 ```
 
-验证（应显示 `crw-rw---- root uinput`）：
+验证（应显示 `crw-rw-rw-`，即任何用户可打开）：
 
 ```bash
 ls -l /dev/uinput
 ```
 
+> **为什么用 `MODE="0666"` 而不是 `GROUP=` 规则？** brltty 包自带一条会对
+> `/dev/uinput` 跑 `setfacl` 的 udev 规则；开机时若它抢先作用在刚创建的节点上，
+> 会把 `group::---` 烤进 POSIX ACL——之后 udev 的 `MODE=` 只能更新 ACL 的
+> *mask*，组成员资格重启后就静默失效。ACL 不含 other 档，所以
+> `MODE="0666"` 才是可靠写法。（多用户机器请权衡代价：任何本地账户都能注入输入事件。）
+
 > **坑：** 如果 `/dev/uinput` 显示 `crw------- root root`，
 > **同时** `lsmod | grep uinput` 没有输出，说明模块并未加载、这个节点只是
-> 一个残留——udev 根本看不到它，udev 规则救不了你。先执行
+> 一个残留——内核会在自动加载模块之前就拒绝打开，udev 救不了你。先执行
 > `sudo modprobe uinput`，再重新触发 udev。
 
 #### 0.2 编码器（三选一；服务端自动探测）
@@ -520,10 +527,17 @@ capture->send: avg 1.1 ms, max 2.0 ms, 3.6 Mbps, fps cap/enc/sent 60/60/58, drop
 ## ❓ 故障排查
 
 **Q：服务端一按 Start 就失败，报 "Cannot open /dev/uinput" / "Failed to create virtual device"。**
-*   `uinput` 模块未加载或节点不可写。见上文 **配置与使用 → 0.1** 的一次性
-    准备：`sudo modprobe uinput`、udev 规则、加入 `uinput` 用户组。
+*   `uinput` 模块未加载或节点对你的用户不可写。见上文 **配置与使用 → 0.1**：
+    *   **Arch 包**（`pkgrel ≥ 2`）：udev 规则随包自动装好——直接升级
+        （`sudo pacman -U …`）即可。若仍失败，执行
+        `sudo modprobe uinput && sudo udevadm trigger --action=change --name-match=uinput`。
+    *   **手动 / tarball**：`sudo modprobe uinput`，再按 0.1 配置
+        `KERNEL=="uinput", MODE="0666"` udev 规则并 reload/trigger。
     如果 `/dev/uinput` 是 `crw------- root root` 而 `lsmod | grep uinput`
-    为空，就是模块没加载。（用 `sudo` 跑服务端也能通，但不推荐。）
+    为空，就是模块没加载。
+    *   以前在 `/etc/udev/rules.d/` 建过 `GROUP=` 规则？删掉它——udev 最后
+        应用 `/etc` 规则，它的 `MODE="0660"` 会把修复改回去。
+    （用 `sudo` 跑服务端也能通，但不推荐。）
 
 **Q：服务端报告 "no usable H.264 encoder"。**
 *   错误信息里列出了每个后端失败的原因。常见原因：

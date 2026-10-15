@@ -1,0 +1,12 @@
+# drawing-tablet: let the server create virtual input devices without root.
+#
+# MODE="0666" instead of the more usual GROUP="uinput", MODE="0660": the
+# brltty package ships a udev rule (90-brltty-uinput.rules) that runs setfacl
+# on /dev/uinput. When that races a freshly created node at boot it bakes
+# "group::---" into the POSIX ACL, and a later udev MODE= can only update the
+# ACL *mask* - never the group class - so group membership silently stops
+# working after a reboot. The "other" class is not part of any ACL, so
+# MODE="0666" keeps the device openable by any user regardless.
+# (On a multi-user machine weigh the trade-off: every local account can then
+# inject input events.)
+KERNEL=="uinput", MODE="0666"

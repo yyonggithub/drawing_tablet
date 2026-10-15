@@ -1,7 +1,7 @@
 # Maintainer: lemonxah <lemonxah@gmail.com>
 pkgname=drawing-tablet
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Stream your desktop to an Android tablet and use it as a drawing tablet"
 arch=('x86_64')
 url="https://github.com/lemonxah/drawing_tablet"
@@ -29,6 +29,7 @@ optdepends=(
     'intel-media-driver: Intel VA-API support'
     'libva-mesa-driver: AMD VA-API support'
 )
+install=drawing-tablet.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -56,6 +57,12 @@ package() {
     
     # Install binary
     install -Dm755 "target/release/dt-server" "$pkgdir/usr/bin/drawing-tablet"
+    
+    # Install udev rule so any local user can open /dev/uinput (the install
+    # script reloads udev; see pkg/70-drawing-tablet-uinput.rules for why
+    # MODE="0666" and not a GROUP= rule)
+    install -Dm644 "pkg/70-drawing-tablet-uinput.rules" \
+        "$pkgdir/usr/lib/udev/rules.d/70-drawing-tablet-uinput.rules"
     
     # Install desktop file
     install -Dm644 "pkg/drawing-tablet.desktop" "$pkgdir/usr/share/applications/drawing-tablet.desktop"

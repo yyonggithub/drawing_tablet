@@ -1,0 +1,11 @@
+post_install() {
+    udevadm control --reload-rules
+    udevadm trigger --action=change --name-match=uinput
+    echo ">>> /dev/uinput access rule installed."
+    echo ">>> If Start still fails with 'Permission denied', run:"
+    echo ">>>     sudo modprobe uinput && sudo udevadm trigger --action=change --name-match=uinput"
+}
+
+post_upgrade() {
+    post_install
+}
