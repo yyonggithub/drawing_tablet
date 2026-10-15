@@ -201,12 +201,17 @@ cargo build --release --bin dt-server
 ### 2. 一次性系统准备（重要！）
 
 服务端通过内核的 `uinput` 模块创建虚拟笔/触摸设备，需要一次性准备
-（加载模块、添加 udev 规则、加入用户组）。具体命令见下文
+（加载模块、添加 udev 规则）。具体命令见下文
 **配置与使用 → 0.1 uinput**——其中还包括"`/dev/uinput` 存在但模块其实没加载"的坑。
 编码器、mDNS 与防火墙的准备在同一章节的 **0.2–0.4**。
 
 ### 3. 安装服务端（任选其一）
 
+*   **预构建产物（GitHub Releases）**：每个 `v*` 标签都会在
+    [Releases 页面](https://github.com/yyonggithub/drawing_tablet/releases)
+    发布 Arch 包和 tarball。`pacman -U` 安装 Arch 包（会自动配置
+    `/dev/uinput`），或解压 tarball——见
+    [7. CI 与 GitHub Releases](#7-ci-与-github-releases)。
 *   **直接运行构建产物**：`./target/release/dt-server`
 *   **cargo**：`cargo install --path crates/dt-server` → `~/.cargo/bin/dt-server`
 *   **Arch Linux**：用仓库自带的 `PKGBUILD`（发行版）或 `PKGBUILD-git`
@@ -260,12 +265,30 @@ Wayland 门户、PipeWire 和 uinput）。
     `target/` 与 Gradle 构建目录留在工作区里，重复构建走增量、
     产物在宿主机直接可见。
 *   `package` 在 `dist/` 产出三件套：release 二进制、带版本号的 tarball
-    （二进制 + `.desktop` + 图标 + 许可证 + 双语 README）、以及用仓库
-    PKGBUILD 基于**当前工作区代码**构建的 Arch 包（`source=` 已切换为
-    本地 tarball）。
+    （二进制 + `.desktop` + 图标 + udev 规则 + 许可证 + 双语 README）、
+    以及用仓库 PKGBUILD 基于**当前工作区代码**构建的 Arch 包
+    （`source=` 已切换为本地 tarball）。
 *   `apk` 产出 `dist/drawing-tablet-<版本>-debug.apk`；导出
     `KEYSTORE_PASSWORD`/`KEY_PASSWORD` 并提供
     `android/drawing_tablet.keystore` 则出 release APK。
+
+### 7. CI 与 GitHub Releases
+
+*   **CI**（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：每次
+    push `main` 和每个 PR 都会跑 `cargo test` 并编译一个 debug APK——两者都在
+    与 §6 相同的 Docker 镜像里进行（buildx 层缓存），CI 与本地构建不会走样。
+*   **Releases**
+    （[`.github/workflows/release.yml`](.github/workflows/release.yml)）：
+    推送 `v*` 标签后，全部产物经 `docker/dt.sh package` / `apk` 构建，
+    并自动创建带三个附件的 GitHub Release——
+    `drawing-tablet-<版本>-linux-x86_64.tar.gz`、
+    `drawing-tablet-<版本>-<rel>-x86_64.pkg.tar.zst`（内含 udev 规则；
+    `pkgrel ≥ 2` 会自动配置 `/dev/uinput`）和
+    `drawing-tablet-<apk版本>-<debug|release>.apk`。
+*   仓库配置了 `ANDROID_KEYSTORE_B64`（base64 编码的 keystore）、
+    `KEYSTORE_PASSWORD` 和 `KEY_PASSWORD` secrets 时，Release 里的 APK 为
+    **签名版**——否则附的是 debug APK。
+*   版本号刻意解耦：git 标签、软件包版本与 APK `versionName` 各自独立维护。
 
 ---
 

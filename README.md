@@ -206,13 +206,18 @@ cargo build --release --bin dt-server
 
 The server creates the virtual pen/touch devices through the kernel's
 `uinput` module, which needs a one-time setup (load the module, add the udev
-rule, join the group). See **Configuration & Usage → 0.1 `uinput`** below for
-the exact commands — and for the pitfall where `/dev/uinput` exists but the
-module is not loaded. The encoder, mDNS and firewall setup are in
-**0.2–0.4** of the same section.
+rule). See **Configuration & Usage → 0.1 `uinput`** below for the exact
+commands — and for the pitfall where `/dev/uinput` exists but the module is
+not loaded. The encoder, mDNS and firewall setup are in **0.2–0.4** of the
+same section.
 
 ### 3. Install the server (pick one)
 
+*   **Prebuilt (GitHub Releases)**: every `v*` tag publishes an Arch package
+    and a tarball on the
+    [Releases page](https://github.com/yyonggithub/drawing_tablet/releases).
+    `pacman -U` the package (it sets up `/dev/uinput` automatically) or
+    extract the tarball — see [7. CI & GitHub Releases](#7-ci--github-releases).
 *   **Run from the build tree**: `./target/release/dt-server`
 *   **cargo**: `cargo install --path crates/dt-server` → `~/.cargo/bin/dt-server`
 *   **Arch Linux**: `makepkg -si` with the bundled `PKGBUILD` (release) or
@@ -268,12 +273,33 @@ installed): `just docker-image [server|android|all]`, `just docker-dev …`,
     `target/` and the Gradle build dirs stay in the worktree, so rebuilds are
     incremental and artifacts remain visible on the host.
 *   `package` produces three artifacts in `dist/`: the release binary, a
-    versioned tarball (binary + `.desktop` + icon + license + READMEs) and an
-    Arch package built from your **current working tree** with the repo's
-    PKGBUILD (its `source=` is switched to a local tarball).
+    versioned tarball (binary + `.desktop` + icon + udev rule + license +
+    READMEs) and an Arch package built from your **current working tree**
+    with the repo's PKGBUILD (its `source=` is switched to a local tarball).
 *   `apk` produces `dist/drawing-tablet-<version>-debug.apk`; export
     `KEYSTORE_PASSWORD`/`KEY_PASSWORD` and provide
     `android/drawing_tablet.keystore` to get a release APK instead.
+
+### 7. CI & GitHub Releases
+
+*   **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): every
+    push to `main` and every PR runs `cargo test` and compiles a debug APK —
+    both inside the same Docker images as §6 (buildx layer cache), so CI
+    and local builds cannot drift apart.
+*   **Releases**
+    ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
+    pushing a `v*` tag builds everything through `docker/dt.sh package` /
+    `apk` and publishes a GitHub Release with three attachments —
+    `drawing-tablet-<ver>-linux-x86_64.tar.gz`,
+    `drawing-tablet-<ver>-<rel>-x86_64.pkg.tar.zst` (includes the udev rule;
+    `pkgrel ≥ 2` sets up `/dev/uinput` automatically) and
+    `drawing-tablet-<apkVer>-<debug|release>.apk`.
+*   The APK attached to a release is **signed** when the
+    `ANDROID_KEYSTORE_B64` (base64-encoded keystore), `KEYSTORE_PASSWORD`
+    and `KEY_PASSWORD` repository secrets are set — otherwise a debug APK
+    is shipped.
+*   Versioning is decoupled on purpose: the git tag, the package version
+    and the APK `versionName` are maintained independently.
 
 ---
 
